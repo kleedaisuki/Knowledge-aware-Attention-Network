@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "knowledge-aware-attention-network"
+version = "0.1.0"
+description = "Reimplementation of Knowledge-aware Attention Network (KAN) for fake news detection."
+authors = [
+  { name = "Jiarui Guo", email = "guojiarui@mail.nankai.edu.cn" }
+]
+readme = "README.md"
+license = { text = "GPL-3.0" }
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.41",
+  "pandas>=2.0",
+  "numpy>=1.26",
+  "scikit-learn>=1.4",
+  "SPARQLWrapper>=2.0.0",
+  "tqdm>=4.66",
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+# Optional：pip install .[dev]
+dev = [
+  "pytest>=8.0",
+  "black>=24.0",
+  "ruff>=0.5",
+  "mypy>=1.10",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

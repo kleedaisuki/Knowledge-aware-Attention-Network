@@ -1,0 +1,21 @@
+# --- Core deep learning stack ---
+torch>=2.2
+transformers>=4.41
+
+# --- Data & utils ---
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+
+# --- Knowledge graph / SPARQL ---
+SPARQLWrapper>=2.0.0
+
+# --- Training QoL ---
+tqdm>=4.66                  
+rich>=13.7                 
+
+# --- Dev tools ---
+pytest>=8.0          
+black>=24.0               
+ruff>=0.5                   
+mypy>=1.10                  
