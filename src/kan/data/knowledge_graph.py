@@ -141,7 +141,7 @@ class KnowledgeGraphClient:
             if isinstance(data, list):
                 return [str(x) for x in data]
         except Exception as e:  # noqa: BLE001
-            logger.warn(f"Failed to load neighbor cache for {entity_id}: {e}")
+            logger.warning(f"Failed to load neighbor cache for {entity_id}: {e}")
         return None
 
     def _save_neighbors_to_disk(self, entity_id: str, neighbors: List[str]) -> None:

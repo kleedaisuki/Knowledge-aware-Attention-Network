@@ -21,6 +21,7 @@ Knowledge-aware-Attention-Network/
 │     │
 │     ├─ models/           # KAN 模型本体
 │     │  ├─ __init__.py
+│     │  ├─ pooling.py
 │     │  ├─ transformer_encoder.py
 │     │  ├─ knowledge_encoder.py
 │     │  ├─ attention.py
