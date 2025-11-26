@@ -1,0 +1,67 @@
+{
+    "dataset": {
+        "csv_path": "data/train.csv",
+        "batch_size": 32,
+        "shuffle": true,
+        "text_field": "text",
+        "id_field": "id",
+        "label_field": "label"
+    },
+    "preprocess": {
+        "do_lowercase": true,
+        "remove_urls": true,
+        "remove_user_mentions": true,
+        "max_tokens": 512,
+        "enable_kg": true
+    },
+    "kg": {
+        "endpoint_url": "https://query.wikidata.org/sparql",
+        "user_agent": "KAN-KG-Client/0.1 (https://example.org; mailto:you@example.org)",
+        "timeout": 30,
+        "max_neighbors": 32,
+        "cache_dir": "data/kg_cache",
+        "language": "en"
+    },
+    "text_encoder": {
+        "d_model": 100,
+        "nhead": 4,
+        "num_layers": 1,
+        "dim_feedforward": 2048,
+        "dropout": 0.5,
+        "activation": "relu",
+        "layer_norm_eps": 1e-5,
+        "batch_first": true
+    },
+    "knowledge_encoder": {
+        "share_encoder": false,
+        "encoder": {
+            "d_model": 100,
+            "nhead": 4,
+            "num_layers": 1,
+            "dim_feedforward": 2048,
+            "dropout": 0.5,
+            "activation": "relu",
+            "layer_norm_eps": 1e-5,
+            "batch_first": true
+        }
+    },
+    "attention": {
+        "d_model": 100,
+        "nhead": 4,
+        "dropout": 0.5,
+        "bias": true,
+        "batch_first": true
+    },
+    "training": {
+        "num_epochs": 20,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "warmup_steps": 0,
+        "gradient_clip": 1.0,
+        "device": "cuda",
+        "seed": 42,
+        "output_dir": "train/models/kan_politifact",
+        "log_dir": "train/logs/kan_politifact",
+        "save_every": 1
+    }
+}
