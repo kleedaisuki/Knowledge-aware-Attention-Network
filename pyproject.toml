@@ -25,7 +25,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Optional：pip install .[dev]
+# Optional：pip install -e .[dev]
 dev = [
   "pytest>=8.0",
   "black>=24.0",
