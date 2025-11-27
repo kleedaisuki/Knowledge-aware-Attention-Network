@@ -12,12 +12,20 @@ Knowledge-aware-Attention-Network/
 │  │  ├─ __init__.py
 │  │  │
 │  │  ├─ configs/
+│  │  │  └─ default.json
 │  │  │
 │  │  ├─ data/             # 数据 & 知识图谱相关
 │  │  │  ├─ __init__.py
 │  │  │  ├─ datasets.py
 │  │  │  ├─ preprocessing.py
 │  │  │  └─ knowledge_graph.py
+│  │  │
+│  │  ├─ repr/
+│  │  │  ├─ __init__.py
+│  │  │  ├─ vocab.py            # 构建 & 管理词表 / 实体表
+│  │  │  ├─ text_embedding.py   # 文本词嵌入 + 位置编码
+│  │  │  ├─ entity_embedding.py # 实体 / 实体上下文嵌入
+│  │  │  └─ batching.py         # PreprocessedSample -> KAN 输入张量
 │  │  │
 │  │  ├─ models/           # KAN 模型本体
 │  │  │  ├─ __init__.py

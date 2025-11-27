@@ -21,6 +21,12 @@ from kan.models.attention import KnowledgeAttentionConfig
 from kan.training.trainer import TrainingConfig
 from kan.training.evaluator import EvaluationConfig
 
+# repr 子系统的配置
+from kan.repr.vocab import VocabConfig
+from kan.repr.text_embedding import TextEmbeddingConfig
+from kan.repr.entity_embedding import EntityEmbeddingConfig
+from kan.repr.batching import BatchingConfig
+
 logger = get_logger(__name__)
 
 
@@ -37,6 +43,13 @@ class ExperimentConfig:
     @param dataset 数据集相关配置。Dataset configuration.
     @param preprocess 预处理配置。Preprocessing configuration.
     @param kg 知识图谱客户端配置。Knowledge graph client configuration.
+    @param text_vocab 文本词表构建配置。Text vocabulary construction config.
+    @param entity_vocab 实体词表构建配置。Entity vocabulary construction config.
+    @param text_embedding 文本嵌入层配置（d_model、max_len 等超参数）。
+           Text embedding config (d_model, max_len, dropout, etc.).
+    @param entity_embedding 实体/上下文嵌入层配置。Entity / context embedding config.
+    @param batching 批处理配置（最大长度、是否加 BOS/EOS 等）。
+           Batching config (truncation limits, BOS/EOS, etc.).
     @param text_encoder 文本 Transformer 编码器配置。Text Transformer encoder config.
     @param knowledge_encoder 知识编码器配置。Knowledge encoder config.
     @param attention 知识注意力层配置。Knowledge attention config.
@@ -44,12 +57,24 @@ class ExperimentConfig:
     @param evaluation 评估 / 推理流程配置。Evaluation / inference pipeline config.
     """
 
+    # 数据 / 预处理 / 知识图谱
     dataset: DatasetConfig
     preprocess: PreprocessConfig
     kg: KnowledgeGraphConfig
+
+    # repr：词表 / 嵌入 / 批处理
+    text_vocab: VocabConfig
+    entity_vocab: VocabConfig
+    text_embedding: TextEmbeddingConfig
+    entity_embedding: EntityEmbeddingConfig
+    batching: BatchingConfig
+
+    # 编码器 & 注意力
     text_encoder: TransformerEncoderConfig
     knowledge_encoder: KnowledgeEncoderConfig
     attention: KnowledgeAttentionConfig
+
+    # 训练 & 评估
     training: TrainingConfig
     evaluation: EvaluationConfig
 
@@ -101,6 +126,29 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         **_filter_kwargs(KnowledgeGraphConfig, data.get("kg", {}))
     )
 
+    # ========================================================
+    # repr 配置：text_vocab / entity_vocab / text/entity embedding / batching
+    # 约定 JSON 结构：
+    # "repr": {
+    #   "text_vocab": {...},
+    #   "entity_vocab": {...},
+    #   "text_embedding": {...},
+    #   "entity_embedding": {...},
+    #   "batching": {...}
+    # }
+    # ========================================================
+    repr_raw = data.get("repr", {}) or {}
+
+    # --- text vocab ---
+    text_vocab_cfg = VocabConfig(
+        **_filter_kwargs(VocabConfig, repr_raw.get("text_vocab", {}))
+    )
+
+    # --- entity vocab ---
+    entity_vocab_cfg = VocabConfig(
+        **_filter_kwargs(VocabConfig, repr_raw.get("entity_vocab", {}))
+    )
+
     # ---------- text encoder (news encoder) ----------
     text_encoder_cfg = TransformerEncoderConfig(
         **_filter_kwargs(TransformerEncoderConfig, data.get("text_encoder", {}))
@@ -141,6 +189,43 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
             nhead=text_encoder_cfg.nhead,
         )
 
+    # ---------- repr: text / entity embedding & batching ----------
+    # 这里我们允许 JSON 只提供部分字段，其余使用默认值；
+    # 对于 vocab_size 无法在配置阶段确定的情况，使用占位符 0，
+    # 后续实际构建时推荐使用 TextEmbedding.from_vocab / EntityEmbedding.from_vocab。
+    # Text Embedding
+    te_raw = repr_raw.get("text_embedding", {}) or {}
+    te_kwargs = _filter_kwargs(TextEmbeddingConfig, te_raw)
+    if "vocab_size" not in te_kwargs:
+        te_kwargs["vocab_size"] = 0  # 占位，实际构建时由 vocab 决定
+    if "d_model" not in te_kwargs:
+        te_kwargs["d_model"] = text_encoder_cfg.d_model
+    text_embedding_cfg = TextEmbeddingConfig(**te_kwargs)
+
+    # Entity Embedding
+    ee_raw = repr_raw.get("entity_embedding", {}) or {}
+    ee_kwargs = _filter_kwargs(EntityEmbeddingConfig, ee_raw)
+    if "vocab_size" not in ee_kwargs:
+        ee_kwargs["vocab_size"] = 0  # 占位，实际构建时由 entity_vocab 决定
+
+    if "d_model" not in ee_kwargs:
+        # 优先与知识编码器对齐；若缺失则退回文本编码器维度
+        d_model_default = getattr(knowledge_encoder_cfg, "d_model", None)
+        if d_model_default is None:
+            encoder = getattr(knowledge_encoder_cfg, "encoder", None)
+            if hasattr(encoder, "d_model"):
+                d_model_default = encoder.d_model
+            else:
+                d_model_default = text_encoder_cfg.d_model
+        ee_kwargs["d_model"] = d_model_default
+
+    entity_embedding_cfg = EntityEmbeddingConfig(**ee_kwargs)
+
+    # Batching
+    batching_cfg = BatchingConfig(
+        **_filter_kwargs(BatchingConfig, repr_raw.get("batching", {}))
+    )
+
     # ---------- training ----------
     training_cfg = TrainingConfig(
         **_filter_kwargs(TrainingConfig, data.get("training", {}))
@@ -157,6 +242,11 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         dataset=dataset_cfg,
         preprocess=preprocess_cfg,
         kg=kg_cfg,
+        text_vocab=text_vocab_cfg,
+        entity_vocab=entity_vocab_cfg,
+        text_embedding=text_embedding_cfg,
+        entity_embedding=entity_embedding_cfg,
+        batching=batching_cfg,
         text_encoder=text_encoder_cfg,
         knowledge_encoder=knowledge_encoder_cfg,
         attention=attention_cfg,

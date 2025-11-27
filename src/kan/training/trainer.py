@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, asdict
-from typing import Iterable, Mapping, Any, Optional
+from typing import Iterable
 
 import torch
 from torch import nn, Tensor
 from torch.optim import AdamW
 
 from kan.utils.logging import get_logger
+from kan.repr.batching import BatchEncoding
 
 logger = get_logger(__name__)
 
@@ -67,23 +68,25 @@ class Trainer:
     """
     @brief 纯训练用 Trainer：只负责前向 + 反向 + 保存权重，不做评估。
            Pure training Trainer: forward + backward + checkpoint saving, no evaluation.
+
+    @note 本 Trainer 只支持 kan.repr.batching.BatchEncoding 这一种 batch 形式，
+          推荐配合 Batcher 作为 DataLoader 的 collate_fn 使用。
+          This Trainer only supports kan.repr.batching.BatchEncoding batches,
+          typically produced by Batcher as DataLoader.collate_fn.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        train_data: Iterable[Mapping[str, Any]],
+        train_data: Iterable[BatchEncoding],
         cfg: TrainingConfig,
     ) -> None:
         """
         @brief 构造 Trainer 实例。
                Construct a Trainer instance.
         @param model 待训练的 PyTorch 模型（例如 KAN）。Model to train (e.g. KAN).
-        @param train_data 可迭代的训练 batch 序列，每个 batch 是一个 mapping。
-               Iterable of training batches; each batch is a mapping.
-               要求至少包含字段 "labels"（标签张量），其它键将原样传入 model(**inputs)。
-               Requires at least key "labels" (label tensor); other keys are
-               passed to model(**inputs).
+        @param train_data 可迭代的训练 batch 序列，每个 batch 为 BatchEncoding。
+               Iterable of training batches, each a BatchEncoding instance.
         @param cfg TrainingConfig 训练配置。Training configuration.
         """
         self.model = model
@@ -214,41 +217,49 @@ class Trainer:
 
         logger.info("Training finished. Total steps: %d", global_step)
 
-    def _train_one_batch(self, batch: Mapping[str, Any]) -> float:
+    # --------------------------------------------------------
+    # 单 batch 训练（只接受 BatchEncoding）
+    # --------------------------------------------------------
+    def _train_one_batch(self, batch: BatchEncoding) -> float:
         """
         @brief 对单个 batch 执行前向 + 反向 + 更新参数。
-               Run forward + backward + parameter update for one batch.
-        @param batch 一个 batch 的数据，需包含 "labels" 键，其余键将作为输入传给模型。
-               One training batch; must contain key "labels". Other keys are fed
-               to the model as keyword arguments.
+               Run forward + backward + parameter update for one BatchEncoding.
+        @param batch 一个 batch 的数据，必须是 BatchEncoding，并包含 labels。
+               One training batch; must be BatchEncoding with non-None labels.
         @return 当前 batch 的标量 loss 值（Python float）。
                 Scalar loss value for this batch (Python float).
         """
-        if "labels" not in batch:
-            raise KeyError(
-                'Trainer expects batch to contain key "labels" with target tensor.'
+        if batch.labels is None:
+            raise RuntimeError(
+                "BatchEncoding.labels is None; training requires labels."
             )
 
-        # 将 batch 中的张量移动到目标设备
-        inputs: dict[str, Any] = {}
-        labels: Optional[Tensor] = None
+        # ---------- 将 BatchEncoding 中的张量移动到目标设备 ----------
+        inputs: dict[str, Tensor] = {}
 
-        for k, v in batch.items():
-            if isinstance(v, Tensor):
-                v = v.to(self.device)
-            if k == "labels":
-                labels = v  # type: ignore[assignment]
-            else:
-                inputs[k] = v
+        # 文本部分
+        inputs["token_ids"] = batch.token_ids.to(self.device)
+        inputs["token_padding_mask"] = batch.token_padding_mask.to(self.device)
 
-        if labels is None:
-            raise RuntimeError("labels tensor is missing or invalid in batch.")
+        # 实体 & 上下文部分（可能为空）
+        if batch.entity_ids is not None:
+            inputs["entity_ids"] = batch.entity_ids.to(self.device)
+        if batch.entity_padding_mask is not None:
+            inputs["entity_padding_mask"] = batch.entity_padding_mask.to(self.device)
+        if batch.context_ids is not None:
+            inputs["context_ids"] = batch.context_ids.to(self.device)
+        if batch.context_padding_mask is not None:
+            inputs["context_padding_mask"] = batch.context_padding_mask.to(self.device)
 
+        labels: Tensor = batch.labels.to(self.device)
+
+        # ---------- 前向 + 反向 + 更新 ----------
         self.optimizer.zero_grad(set_to_none=True)
 
-        # 前向：支持模型返回 Tensor 或 dict(logits=...)
+        # 模型输出支持 Tensor 或 Mapping(logits=...)
         outputs = self.model(**inputs)
-        if isinstance(outputs, Mapping):
+
+        if isinstance(outputs, dict):
             if "logits" in outputs:
                 logits = outputs["logits"]
             else:
