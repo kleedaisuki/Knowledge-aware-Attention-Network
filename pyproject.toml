@@ -24,6 +24,9 @@ dependencies = [
   "rich>=13.7",
 ]
 
+[project.scripts]
+kan = "kan_cli.main:main"
+
 [project.optional-dependencies]
 # Optional：pip install -e .[dev]
 dev = [
