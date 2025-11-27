@@ -19,6 +19,7 @@ from kan.models.transformer_encoder import TransformerEncoderConfig
 from kan.models.knowledge_encoder import KnowledgeEncoderConfig
 from kan.models.attention import KnowledgeAttentionConfig
 from kan.training.trainer import TrainingConfig
+from kan.training.evaluator import EvaluationConfig
 
 logger = get_logger(__name__)
 
@@ -40,6 +41,7 @@ class ExperimentConfig:
     @param knowledge_encoder 知识编码器配置。Knowledge encoder config.
     @param attention 知识注意力层配置。Knowledge attention config.
     @param training 训练流程配置。Training pipeline config.
+    @param evaluation 评估 / 推理流程配置。Evaluation / inference pipeline config.
     """
 
     dataset: DatasetConfig
@@ -49,6 +51,7 @@ class ExperimentConfig:
     knowledge_encoder: KnowledgeEncoderConfig
     attention: KnowledgeAttentionConfig
     training: TrainingConfig
+    evaluation: EvaluationConfig
 
 
 # ============================================================
@@ -143,6 +146,13 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         **_filter_kwargs(TrainingConfig, data.get("training", {}))
     )
 
+    # ---------- evaluation ----------
+    # 若 JSON 中没有 evaluation 字段，则使用 EvaluationConfig 的默认参数
+    # If "evaluation" is not present in JSON, EvaluationConfig defaults are used.
+    evaluation_cfg = EvaluationConfig(
+        **_filter_kwargs(EvaluationConfig, data.get("evaluation", {}))
+    )
+
     return ExperimentConfig(
         dataset=dataset_cfg,
         preprocess=preprocess_cfg,
@@ -151,6 +161,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         knowledge_encoder=knowledge_encoder_cfg,
         attention=attention_cfg,
         training=training_cfg,
+        evaluation=evaluation_cfg,
     )
 
 

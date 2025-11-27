@@ -138,30 +138,15 @@ class Trainer:
 
     def _set_seed(self, seed: int) -> None:
         """
-        @brief 设置全局随机种子（尽量兼容 utils.seed，但不存在也能工作）。
-               Set global random seed (tries utils.seed if available, otherwise basic seeding).
+        @brief 设置全局随机种子。
+               Set global random seed.
         @param seed 随机种子值。Random seed.
         """
-        # 优先使用 kan.utils.seed（如果未来实现了）
-        try:
-            from kan.utils import seed as seed_utils  # type: ignore[import-not-found]
+        from kan.utils import seed as seed_utils  # type: ignore[import-not-found]
 
-            if hasattr(seed_utils, "set_global_seed"):
-                seed_utils.set_global_seed(seed)  # type: ignore[attr-defined]
-                logger.info("Global seed set via kan.utils.seed: %d", seed)
-                return
-        except Exception:  # noqa: BLE001
-            # 没有 seed 工具就退化为最基础版本
-            pass
-
-        # 退化方案：最基础的 PyTorch + Python 随机数种子
-        import random
-
-        random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        logger.info("Global seed set via basic torch/random: %d", seed)
+        seed_utils.set_global_seed(seed)  # type: ignore[attr-defined]
+        logger.info("Global seed set via kan.utils.seed: %d", seed)
+        return
 
     # --------------------------------------------------------
     # Warmup 学习率调度（仅线性 warmup）

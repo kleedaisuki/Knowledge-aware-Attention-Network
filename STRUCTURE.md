@@ -34,7 +34,7 @@ Knowledge-aware-Attention-Network/
 │     │
 │     └─ utils/            # 通用工具
 │        ├─ __init__.py
-│        ├─ config.py
+│        ├─ configs.py
 │        ├─ logging.py
 │        ├─ metrics.py
 │        └─ seed.py
@@ -42,7 +42,7 @@ Knowledge-aware-Attention-Network/
 ├─ data/
 │   ├─ news/
 │   │   ├─ train.csv
-│   │   └─ A/Btest.csv
+│   │   └─ Atest.csv
 │   └─ kg_cache/      
 │
 ├─ train/

@@ -16,7 +16,7 @@
     },
     "kg": {
         "endpoint_url": "https://query.wikidata.org/sparql",
-        "user_agent": "KAN-KG-Client/0.1 (https://example.org; mailto:you@example.org)",
+        "user_agent": "KAN-KG-Client/0.1 (https://www.nankai.edu.cn; mailto:guojiarui@mail.nankai.edu.cn)",
         "timeout": 30,
         "max_neighbors": 32,
         "cache_dir": "data/kg_cache",
@@ -60,8 +60,17 @@
         "gradient_clip": 1.0,
         "device": "cuda",
         "seed": 42,
-        "output_dir": "train/models/kan_politifact",
-        "log_dir": "train/logs/kan_politifact",
+        "output_dir": "train/models/weibo",
+        "log_dir": "train/logs/weibo",
         "save_every": 1
+    },
+    "evaluation": {
+        "device": "cuda",
+        "seed": 42,
+        "checkpoint_path": null,
+        "results_csv": "train/results/results.csv",
+        "threshold": 0.5,
+        "has_labels": true,
+        "compute_metrics": true
     }
 }
