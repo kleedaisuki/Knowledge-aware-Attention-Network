@@ -32,25 +32,31 @@ class KANForTrainer(nn.Module):
 
     def forward(self, **inputs: Any) -> Tensor:
         """
-        @brief 前向计算，调用内部 KAN，但只返回 logits。
-               Forward pass: call inner KAN and return logits only.
-        @param inputs KAN.forward 所需的关键字参数（news_embeddings 等）。
-               Keyword arguments required by KAN.forward (news_embeddings, etc.).
-        @return logits 张量，形状为 (B, num_classes)。
-                Logits tensor of shape (B, num_classes).
+        @brief 前向计算，调用内部 KAN，仅返回正类 logit（一维）。
+            Forward pass: call the inner KAN and return positive-class logits only.
+        @return 形状为 (B,) 的 logits 张量。
+                Logits tensor of shape (B,).
         """
         outputs = self.kan(**inputs)
-        # KAN.forward 返回 (logits, aux)
+
+        # 支持 KAN.forward 返回 (logits, aux) 或直接 logits
         if isinstance(outputs, tuple) and len(outputs) >= 1:
             logits = outputs[0]
-            if not isinstance(logits, Tensor):
-                raise RuntimeError(
-                    f"KANForTrainer: expected first item of outputs to be Tensor, "
-                    f"got {type(logits)!r}"
-                )
-            return logits
-        if isinstance(outputs, Tensor):
-            return outputs
-        raise RuntimeError(
-            f"KANForTrainer: unsupported KAN output type {type(outputs)!r}"
-        )
+        else:
+            logits = outputs
+
+        if not isinstance(logits, Tensor):
+            raise RuntimeError(
+                f"KANForTrainer: expected Tensor logits, got {type(logits)!r}"
+            )
+
+        # 若是二分类多通道输出，取正类 logit；若只有一通道，直接展平为 (B,)
+        if logits.dim() == 2 and logits.size(-1) == 2:
+            pos_logits = logits[:, 1]
+        elif logits.dim() >= 1 and logits.size(-1) == 1:
+            pos_logits = logits.view(-1)
+        else:
+            # 兜底：假设已经是一维 (B,)
+            pos_logits = logits.view(-1)
+
+        return pos_logits

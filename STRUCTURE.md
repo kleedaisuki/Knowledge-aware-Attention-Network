@@ -42,8 +42,11 @@ Knowledge-aware-Attention-Network/
 │  └─ kan_cli/
 │      ├─ __init__.py
 │      ├─ main.py 
-│      ├─ train.py     
+│      ├─ batching.py
+│      ├─ embedding.py
 │      ├─ evaluate.py
+│      ├─ model_wrapper.py
+│      ├─ train.py
 │      └─ predict.py
 │
 ├─ data/

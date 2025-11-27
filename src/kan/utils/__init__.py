@@ -14,6 +14,7 @@ from __future__ import annotations
 from .configs import (
     load_experiment_config,
     load_config,
+    ExperimentConfig,
 )
 
 # ============================================================
@@ -54,6 +55,7 @@ __all__ = [
     # 配置
     "load_config",
     "load_experiment_config",
+    "ExperimentConfig",
 
     # 日志
     "get_logger",

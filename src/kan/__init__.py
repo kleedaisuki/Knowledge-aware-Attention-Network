@@ -56,6 +56,7 @@ from .utils import (  # type: ignore[F401]
     log_metrics,
     write_probability_csv,
     set_global_seed,
+    ExperimentConfig,
 )
 
 # ============================================================
@@ -101,4 +102,5 @@ __all__ = [
     "log_metrics",
     "write_probability_csv",
     "set_global_seed",
+    "ExperimentConfig",
 ]

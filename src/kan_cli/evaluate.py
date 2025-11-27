@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import argparse
 import json
-from typing import Any, Dict, List
+from typing import List
 
 import torch
 
 import kan  # 顶层 API :contentReference[oaicite:6]{index=6}
 from kan_cli.model_wrapper import KANForTrainer
 from kan_cli.batching import iter_batches_for_inference
+from kan_cli.batching import StringHashEmbedding
+
+logger = kan.get_logger(__name__)
 
 
 def cli_evaluate(args: argparse.Namespace) -> None:
@@ -31,53 +34,47 @@ def cli_evaluate(args: argparse.Namespace) -> None:
     metrics_path: str = args.metrics
     probs_path: str | None = args.probs
 
-    print(f"[KAN-CLI] 评估模型: {model_path}")
-    print(f"[KAN-CLI] 使用数据集: {data_path}")
+    logger.info(f"评估模型: {model_path}")
+    logger.info(f"使用数据集: {data_path}")
 
     # 1. 加载配置（如果提供）
-    if cfg_path is not None:
-        if not hasattr(kan, "load_experiment_config"):
-            raise RuntimeError("KAN CLI: 未找到 kan.load_experiment_config。")
-        exp_cfg = kan.load_experiment_config(cfg_path)  # type: ignore[attr-defined]
-    else:
-        exp_cfg = {}
+    exp_cfg = kan.load_experiment_config(cfg_path)  # type: ignore[attr-defined]
+    if not isinstance(exp_cfg, kan.ExperimentConfig):  # type: ignore[attr-defined]
+        raise RuntimeError(
+            "KAN CLI: load_experiment_config must return ExperimentConfig."
+        )
 
     # 2. 构建配置 dataclass
-    DatasetConfig = kan.DatasetConfig  # type: ignore[attr-defined]
-    PreprocessConfig = kan.PreprocessConfig  # type: ignore[attr-defined]
-    KnowledgeGraphConfig = kan.KnowledgeGraphConfig  # type: ignore[attr-defined]
-    KANConfig = kan.KANConfig  # type: ignore[attr-defined]
+    dataset_cfg = exp_cfg.dataset
+    dataset_cfg.csv_path = data_path  # 覆盖 path
+    dataset_cfg.shuffle = False
 
-    def _sub(name: str, cls: Any) -> Any:
-        if hasattr(exp_cfg, name):
-            val = getattr(exp_cfg, name)
-        elif isinstance(exp_cfg, dict) and name in exp_cfg:
-            val = exp_cfg[name]
-        else:
-            val = {}
-        if isinstance(val, cls):
-            return val
-        if isinstance(val, dict):
-            return cls(**val)  # type: ignore[call-arg]
-        return cls()  # type: ignore[call-arg]
-
-    dataset_cfg = _sub("dataset", DatasetConfig)
-    # 用命令行 data_path 覆盖 CSV 路径
-    dataset_cfg.csv_path = data_path  # type: ignore[attr-defined]
-    dataset_cfg.shuffle = False  # 评估不打乱
-
-    preprocess_cfg = _sub("preprocess", PreprocessConfig)
-    kg_cfg = _sub("knowledge_graph", KnowledgeGraphConfig)
-    model_cfg = _sub("model", KANConfig)
+    preprocess_cfg = exp_cfg.preprocess
+    kg_cfg = exp_cfg.kg
+    text_encoder_cfg = exp_cfg.text_encoder
+    knowledge_encoder_cfg = exp_cfg.knowledge_encoder
+    attention_cfg = exp_cfg.attention
+    evaluation_cfg = (
+        exp_cfg.evaluation
+    )  # 若你准备在这里放 batch_size / threshold 等，可以后续使用
 
     # 3. 构建数据组件
     NewsDataset = kan.NewsDataset  # type: ignore[attr-defined]
     Preprocessor = kan.Preprocessor  # type: ignore[attr-defined]
     KnowledgeGraphClient = kan.KnowledgeGraphClient  # type: ignore[attr-defined]
+    TextEncoderConfig = kan.models.kan.TextEncoderConfig  # type: ignore[attr-defined]
+    KANConfig = kan.KANConfig
 
     dataset = NewsDataset(dataset_cfg)
     kg_client = KnowledgeGraphClient(kg_cfg) if preprocess_cfg.enable_kg else None
     preprocessor = Preprocessor(preprocess_cfg, kg_client=kg_client)
+
+    text_cfg = TextEncoderConfig(encoder=text_encoder_cfg)
+    model_cfg = KANConfig(
+        text=text_cfg,
+        knowledge=knowledge_encoder_cfg,
+        attention=attention_cfg,
+    )
 
     # 4. 构建模型并加载 checkpoint
     KANModel = kan.KAN  # type: ignore[attr-defined]
@@ -91,34 +88,28 @@ def cli_evaluate(args: argparse.Namespace) -> None:
         wrapped_model.load_state_dict(state)
 
     wrapped_model.eval()
-
-    embed_dim = model_cfg.text.encoder.d_model  # type: ignore[attr-defined]
+    embed_dim = model_cfg.text.encoder.d_model
+    embedder = StringHashEmbedding(embed_dim)
 
     # 5. 遍历数据，收集 logits / labels / ids
-    all_labels: List[int] = []
-    all_probs: List[float] = []
-    all_ids: List[int] = []
+    all_labels, all_probs, all_ids = [], [], []
 
     with torch.no_grad():
         for batch in iter_batches_for_inference(
             dataset=dataset,
             preprocessor=preprocessor,
             embed_dim=embed_dim,
+            embedder=embedder,
             with_labels=True,
         ):
             labels = batch.pop("labels").view(-1).to(torch.float32)
             ids = batch.pop("ids")
+
             for k, v in list(batch.items()):
                 if isinstance(v, torch.Tensor):
                     batch[k] = v
 
-            logits = wrapped_model(**batch)  # type: ignore[arg-type]
-            # 二分类：我们取第二类（index=1）的 logit 做 prob
-            if logits.size(-1) == 1:
-                pos_logits = logits.view(-1)
-            else:
-                pos_logits = logits[..., 1].view(-1)
-
+            pos_logits = wrapped_model(**batch)  # (B,) 正类 logit
             probs = torch.sigmoid(pos_logits)
 
             all_labels.extend(labels.cpu().tolist())
@@ -134,15 +125,15 @@ def cli_evaluate(args: argparse.Namespace) -> None:
         threshold=0.5,
     )
 
-    print("[KAN-CLI] 评估指标:")
+    logger.info("评估指标:")
     for k, v in metrics.__dict__.items():  # BinaryClassificationMetrics dataclass
-        print(f"  {k}: {v}")
+        logger.info(f"  {k}: {v}")
 
     # 7. 写 metrics 到 JSON
     metrics_dict = metrics.__dict__
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(metrics_dict, f, ensure_ascii=False, indent=2)
-    print(f"[KAN-CLI] 指标已写入: {metrics_path}")
+    logger.info(f"指标已写入: {metrics_path}")
 
     # 8. 可选写出概率 CSV
     if probs_path is not None:
@@ -157,4 +148,4 @@ def cli_evaluate(args: argparse.Namespace) -> None:
 
             df = pd.DataFrame({"id": all_ids, "prob": all_probs})
             df.to_csv(probs_path, index=False)
-        print(f"[KAN-CLI] 概率结果已写入: {probs_path}")
+        logger.info(f"概率结果已写入: {probs_path}")

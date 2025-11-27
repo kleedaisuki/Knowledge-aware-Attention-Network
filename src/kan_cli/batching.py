@@ -6,10 +6,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Mapping, Sequence
 
 import torch
-from torch import Tensor
 
 import kan  # 使用 NewsSample / PreprocessedSample / Preprocessor / NewsDataset 等 :contentReference[oaicite:4]{index=4}
 from kan_cli.embedding import StringHashEmbedding
@@ -25,10 +24,43 @@ def _ensure_tokens(tokens: Sequence[str]) -> List[str]:
     return list(tokens)
 
 
+class TrainingDataIterable:
+    """
+    @brief 训练数据可重启 iterable，每次迭代都会重新遍历底层数据集并生成 batch。
+           Restartable iterable over training data; each iteration runs a fresh
+           pass over the underlying dataset and yields batches.
+    """
+
+    def __init__(
+        self,
+        dataset: "kan.NewsDataset",  # type: ignore[name-defined]
+        preprocessor: "kan.Preprocessor",  # type: ignore[name-defined]
+        embed_dim: int,
+        embedder: StringHashEmbedding,
+    ) -> None:
+        self.dataset = dataset
+        self.preprocessor = preprocessor
+        self.embed_dim = embed_dim
+        self.embedder = embedder
+
+    def __iter__(self):
+        """
+        @brief 返回一个新的 batch 生成器，用于本轮训练 epoch。
+               Return a fresh batch generator for the current training epoch.
+        """
+        return iter_batches_for_training(
+            dataset=self.dataset,
+            preprocessor=self.preprocessor,
+            embed_dim=self.embed_dim,
+            embedder=self.embedder,
+        )
+
+
 def build_batch_tensors(
     samples: Sequence["kan.PreprocessedSample"],  # type: ignore[name-defined]
     embed_dim: int,
     with_labels: bool,
+    embedder: StringHashEmbedding,
 ) -> Dict[str, Any]:
     """
     @brief 将一批 PreprocessedSample 转换为 KAN.forward 所需张量。
@@ -45,9 +77,6 @@ def build_batch_tensors(
 
     B = len(samples)
     D = embed_dim
-
-    # 哈希嵌入器（文本 / 实体 / 上下文共用一套空间）
-    embedder = StringHashEmbedding(D)
 
     # -------- 文本部分 --------
     token_lists: List[List[str]] = [_ensure_tokens(s.tokens) for s in samples]
@@ -113,6 +142,7 @@ def iter_batches_for_training(
     dataset: "kan.NewsDataset",  # type: ignore[name-defined]
     preprocessor: "kan.Preprocessor",  # type: ignore[name-defined]
     embed_dim: int,
+    embedder: StringHashEmbedding,
 ) -> Iterator[Mapping[str, Any]]:
     """
     @brief 基于 NewsDataset 和 Preprocessor 生成训练用 batch（字典形式）。
@@ -124,9 +154,13 @@ def iter_batches_for_training(
             Iterable of batches; each batch is a mapping for Trainer.
     """
     for raw_batch in dataset.batch_iter():
-        # raw_batch: List[NewsSample]
         pre_samples = preprocessor.preprocess_batch(raw_batch)
-        batch = build_batch_tensors(pre_samples, embed_dim=embed_dim, with_labels=True)
+        batch = build_batch_tensors(
+            pre_samples,
+            embed_dim=embed_dim,
+            with_labels=True,
+            embedder=embedder,
+        )
         yield batch
 
 
@@ -134,6 +168,7 @@ def iter_batches_for_inference(
     dataset: "kan.NewsDataset",  # type: ignore[name-defined]
     preprocessor: "kan.Preprocessor",  # type: ignore[name-defined]
     embed_dim: int,
+    embedder: StringHashEmbedding,
     with_labels: bool,
 ) -> Iterator[Dict[str, Any]]:
     """
@@ -151,8 +186,8 @@ def iter_batches_for_inference(
             pre_samples,
             embed_dim=embed_dim,
             with_labels=with_labels,
+            embedder=embedder,
         )
-        # 为了方便拿到 id 列表，在 batch 里同时附加 'ids'
         ids = [s.id for s in pre_samples]
         batch["ids"] = ids
         yield batch
