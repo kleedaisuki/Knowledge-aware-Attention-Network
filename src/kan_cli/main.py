@@ -1,172 +1,249 @@
 """
 @file main.py
-@brief KAN 命令行工具主入口，负责解析子命令并分发到 train / evaluate / predict 实现。
-       Main entry for the KAN command-line interface, responsible for parsing
-       sub-commands and dispatching to train / evaluate / predict handlers.
+@brief KAN 命令行工具主入口，负责：
+       1) 解析全局与子命令参数；
+       2) 加载 ExperimentConfig；
+       3) 构建 ExperimentRuntime；
+       4) 通过任务注册表调度 train / evaluate / predict 等任务。
+       Main entry for the KAN command-line interface, responsible for:
+       1) parsing global and sub-command arguments;
+       2) loading an ExperimentConfig;
+       3) constructing an ExperimentRuntime;
+       4) dispatching tasks (train / evaluate / predict) via the task registry.
 
-@param argv 命令行参数列表，一般由解释器从系统环境中注入（例如 sys.argv）。
-       argv list of command-line arguments, typically injected by the interpreter
-       from the process environment (e.g., sys.argv).
+@param argv 可选的命令行参数列表，便于测试时注入；实际运行通常由 sys.argv 提供。
+       Optional list of command-line arguments, mainly for testing; in normal
+       usage this is populated from sys.argv.
 
-@note 本模块本身不直接处理训练 / 评估 / 预测逻辑，只负责：
-      1) 定义 CLI 语法（子命令与选项）；
-      2) 将解析后的参数对象转发给相应的处理函数 (cli_train / cli_evaluate / cli_predict)。
-      This module does not implement training / evaluation / inference logic
-      itself. It only:
-      1) defines CLI syntax (sub-commands and options);
-      2) forwards the parsed argument namespace to the corresponding handlers
-         (cli_train / cli_evaluate / cli_predict).
-
-@example
-    # 使用默认配置训练模型
-    # Train a model with the default configuration
-    kan train
-
-    # 使用指定配置文件训练模型
-    # Train a model with a given config JSON
-    kan train --config path/to/config.json
-
-    # 在带标签的数据集上评估已有模型，并输出指标与概率
-    # Evaluate a trained model on a labeled dataset and write metrics / probs
-    kan evaluate \
-        --model path/to/checkpoint.pt \
-        --data path/to/val.csv \
-        --config path/to/config.json \
-        --metrics val_metrics.json \
-        --probs val_results.csv
-
-    # 在无标签测试集上进行预测，输出 id,prob
-    # Run prediction on an unlabeled test set and write id,prob
-    kan predict \
-        --model path/to/checkpoint.pt \
-        --data path/to/test.csv \
-        --config path/to/config.json \
-        --output results.csv
+@note
+    * 本模块自身不再直接依赖具体的 train/evaluate/predict 实现，而是统一通过
+      kan_cli.runtime 中的状态机与任务注册表进行调度。
+      This module no longer depends directly on concrete train/evaluate/predict
+      implementations; instead, it uses the state machine and task registry in
+      kan_cli.runtime for dispatch.
+    * 具体任务应在其它模块中通过 @register_task("train") 等方式完成注册。
+      Concrete tasks should be registered elsewhere via @register_task("train"),
+      etc.
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+from typing import Any, List, Optional
 
-from kan_cli.train import cli_train
-from kan_cli.evaluate import cli_evaluate
-from kan_cli.predict import cli_predict
+from kan import get_logger
+from kan import ExperimentConfig  # 导入仅用于类型提示 / 文档说明
+
+from kan import load_experiment_config
+from kan_cli.runtime import create_runtime, run_task
+
+#  强制导入任务模块，确保 train/evaluate/predict 已注册到 TASK_REGISTRY
+#  Force-load task module so that train/evaluate/predict are registered.
+from kan_cli import tasks as _kan_cli_tasks  # noqa: F401
 
 
 def _build_parser() -> argparse.ArgumentParser:
     """
-    @brief 构建顶层 argparse 解析器，并注册所有子命令。
-           Build the top-level argparse parser and register all sub-commands.
-    @return argparse.ArgumentParser 解析器实例，用于解析命令行参数。
-            argparse.ArgumentParser instance used to parse CLI arguments.
+    @brief 构建顶层 argparse 解析器，并注册全局选项与子命令。
+           Build the top-level argparse parser with global options and sub-commands.
+    @return argparse.ArgumentParser 解析器实例。
+            argparse.ArgumentParser instance.
     """
     parser = argparse.ArgumentParser(
         prog="kan",
         description="KAN: Knowledge-aware Attention Network CLI",
     )
+
+    # -------------------------------
+    # 全局选项 Global options
+    # -------------------------------
+    parser.add_argument(
+        "--config",
+        type=str,
+        required=True,
+        help=(
+            "实验配置 JSON 路径 (Experiment config JSON path, required). "
+            "该文件将被解析为 ExperimentConfig，并驱动数据 / 模型 / 训练等全部流程。"
+        ),
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=str,
+        default="train",
+        help=(
+            "实验工作目录，用于保存模型 / 日志 / 词表等文件；默认为 ./train。"
+            "Working directory for models / logs / vocabs, default './train'."
+        ),
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help=(
+            "覆盖配置中 training.device 的设备字符串，如 'cpu' 或 'cuda:0'。"
+            "Override training.device in config, e.g. 'cpu' or 'cuda:0'."
+        ),
+    )
+
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        help="子命令 (train / evaluate / predict)",
+        help="子命令 (train / evaluate / predict)。Sub-commands.",
     )
 
-    # ---- train ----
-    p_train = subparsers.add_parser("train", help="训练 KAN 模型 (train KAN model)")
-    p_train.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="训练配置 JSON 路径；省略则使用内置 default.json。"
-        "Path to training config JSON; if omitted, use built-in default.json.",
+    # -------------------------------
+    # train 子命令 Train sub-command
+    # -------------------------------
+    p_train = subparsers.add_parser(
+        "train",
+        help="训练 KAN 模型 (train a KAN model).",
     )
-    p_train.set_defaults(func=cli_train)
+    # 训练目前完全由 ExperimentConfig 决定，无额外必需参数
+    p_train.set_defaults(task_name="train")
 
-    # ---- evaluate ----
+    # -------------------------------
+    # evaluate 子命令 Evaluate sub-command
+    # -------------------------------
     p_eval = subparsers.add_parser(
-        "evaluate", help="在带标签数据集上评估 KAN 模型 (evaluate KAN model)"
+        "evaluate",
+        help=(
+            "在带标签数据集上评估已有模型，输出指标与概率等。"
+            "Evaluate a trained model on a labeled dataset."
+        ),
     )
     p_eval.add_argument(
         "--model",
+        "--checkpoint",
+        dest="checkpoint",
         type=str,
         required=True,
-        help="模型 checkpoint 路径。Model checkpoint path.",
-    )
-    p_eval.add_argument(
-        "--data",
-        type=str,
-        required=True,
-        help="带标签的评估 CSV 文件路径，需包含 id,text,label。"
-        "Labeled evaluation CSV path, must contain id,text,label.",
-    )
-    p_eval.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="统一实验配置 JSON 路径（可选）。" "Optional experiment config JSON path.",
+        help=("模型 checkpoint 路径 (.pt)。" "Path to model checkpoint (.pt)."),
     )
     p_eval.add_argument(
         "--metrics",
+        dest="metrics_path",
         type=str,
-        default="metrics.json",
-        help="评估指标输出 JSON 路径。Output JSON path for metrics.",
+        default=None,
+        help=(
+            "评估指标输出 JSON 路径（可选；如省略则由任务内部决定默认位置）。"
+            "Optional JSON path to write metrics; if omitted, task decides default."
+        ),
     )
     p_eval.add_argument(
         "--probs",
+        dest="probs_path",
         type=str,
         default=None,
-        help="若设置，则将 (id,prob) 写入该 CSV 路径。"
-        "If set, write (id,prob) to this CSV path.",
+        help=(
+            "若设置，则将 (id, prob) 概率结果写入该 CSV 路径。"
+            "If set, write (id, prob) probability CSV to this path."
+        ),
     )
-    p_eval.set_defaults(func=cli_evaluate)
+    p_eval.set_defaults(task_name="evaluate")
 
-    # ---- predict ----
+    # -------------------------------
+    # predict 子命令 Predict sub-command
+    # -------------------------------
     p_pred = subparsers.add_parser(
-        "predict", help="对无标签数据集进行预测，输出 id,prob。"
+        "predict",
+        help=(
+            "在无标签测试集上进行预测，输出 id,prob。"
+            "Run prediction on an unlabeled test set, outputting id,prob."
+        ),
     )
     p_pred.add_argument(
         "--model",
+        "--checkpoint",
+        dest="checkpoint",
         type=str,
         required=True,
-        help="模型 checkpoint 路径。Model checkpoint path.",
-    )
-    p_pred.add_argument(
-        "--data",
-        type=str,
-        required=True,
-        help="无标签 CSV 文件路径，需包含 id,text。"
-        "Unlabeled CSV path, must contain id,text.",
-    )
-    p_pred.add_argument(
-        "--config",
-        type=str,
-        default=None,
-        help="实验配置 JSON 路径（可选，用于预处理 / KG 配置）。"
-        "Optional experiment config JSON path (for preprocess / KG).",
+        help=("模型 checkpoint 路径 (.pt)。" "Path to model checkpoint (.pt)."),
     )
     p_pred.add_argument(
         "--output",
+        dest="output_path",
         type=str,
         default="results.csv",
-        help="预测结果输出 CSV，包含 id,prob。"
-        "Output CSV path for prediction results with id,prob.",
+        help=(
+            "预测结果 CSV 输出路径（包含 id,prob），默认 results.csv。"
+            "CSV output path for prediction results (id,prob), default 'results.csv'."
+        ),
     )
-    p_pred.set_defaults(func=cli_predict)
+    p_pred.set_defaults(task_name="predict")
 
     return parser
 
 
-def main() -> None:
+def _load_config(config_path: str) -> ExperimentConfig:
     """
-    @brief KAN CLI 程序入口：解析命令行参数并调用对应的子命令处理函数。
-           Entry point for the KAN CLI: parse command-line arguments and invoke
-           the corresponding sub-command handler.
-    @note 命令行参数由 argparse 从进程的 sys.argv 中自动解析，本函数不显式接收参数。
-          Command-line arguments are parsed from sys.argv by argparse; this
-          function does not take explicit parameters.
+    @brief 从给定路径加载 ExperimentConfig。
+           Load an ExperimentConfig from the given path.
+    @param config_path 配置 JSON 路径。Path to the config JSON file.
+    @return 解析后的 ExperimentConfig 实例。
+            Parsed ExperimentConfig instance.
+    @throws RuntimeError 如未找到合适的加载函数。
+            Raises RuntimeError if no loader function is available.
+    """
+    if load_experiment_config is None:
+        # 如果你使用了不同的配置加载入口，可以在这里集中修改。
+        raise RuntimeError(
+            "load_experiment_config is not available. "
+            "Please expose a config loader as 'kan.load_experiment_config', "
+            "or adjust _load_config(...) in kan_cli.main accordingly."
+        )
+
+    return load_experiment_config(Path(config_path))
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    """
+    @brief KAN CLI 程序入口：解析命令行参数 → 加载配置 → 构建运行时 → 调度任务。
+           Entry point for the KAN CLI: parse args → load config → build runtime
+           → run the requested task via the registry.
+    @param argv 可选的参数列表（测试时使用）；正常运行时可省略。
+           Optional list of CLI arguments (useful in tests); usually omitted.
     """
     parser = _build_parser()
-    args = parser.parse_args()
-    if hasattr(args, "func"):
-        args.func(args)
-    else:
-        parser.print_help()
+    args = parser.parse_args(argv)
+
+    logger = get_logger(__name__)
+    logger.info("[cli] Parsed arguments: %s", args)
+
+    # 1) 加载 ExperimentConfig
+    cfg = _load_config(args.config)
+
+    # 2) 构建 ExperimentRuntime（统一管理设备、随机种子、路径等）
+    runtime = create_runtime(
+        config=cfg,
+        work_dir=args.work_dir,
+        override_device=args.device,
+        logger=logger,
+    )
+
+    # 3) 根据子命令收集任务参数
+    task_kwargs: dict[str, Any] = {}
+    command = args.command
+    task_name: str = getattr(args, "task_name", command)
+
+    if command == "evaluate":
+        task_kwargs["checkpoint_path"] = args.checkpoint
+        if args.metrics_path is not None:
+            task_kwargs["metrics_path"] = args.metrics_path
+        if args.probs_path is not None:
+            task_kwargs["probs_path"] = args.probs_path
+    elif command == "predict":
+        task_kwargs["checkpoint_path"] = args.checkpoint
+        task_kwargs["output_path"] = args.output_path
+    # train 目前不需要额外参数；完全依赖 ExperimentConfig
+
+    # 4) 调度任务：交给 runtime + 注册表处理
+    run_task(
+        task_name=task_name,
+        runtime=runtime,
+        **task_kwargs,
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover - 交给控制台脚本使用
+    main()

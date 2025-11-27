@@ -4,7 +4,15 @@ logger = get_logger(__name__)
 
 
 from typing import Any, Iterable, Optional, Tuple
+import json
+from pathlib import Path
+
 from torch.utils.data import Dataset, DataLoader
+
+from torch import nn
+from torch.optim import AdamW, Optimizer
+from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
+
 
 from kan import (
     Preprocessor,
@@ -20,7 +28,7 @@ from kan import (
     BatchingConfig,
     Batcher,
     KANConfig,
-    KAN
+    KAN,
 )
 
 
@@ -124,13 +132,6 @@ def build_all_dataloaders(
     return train_loader, val_loader, test_loader
 
 
-import json
-from pathlib import Path
-from typing import Any, Iterable, Tuple
-
-from kan.data.preprocessing import PreprocessedSample
-
-
 def _iter_preprocessed_samples(
     train_loader: Iterable[Any],
 ) -> Iterable[PreprocessedSample]:
@@ -228,9 +229,6 @@ def build_or_load_vocabs(
     return text_vocab, entity_vocab
 
 
-from typing import Any
-
-
 def build_batcher(
     config: Any,
     text_vocab: Vocab,
@@ -291,25 +289,6 @@ def build_model_from_config(config: Any) -> KAN:
         # 如需覆盖，可在 ExperimentConfig 中扩展相应字段后在此读取。
     )
     return KAN(kan_cfg)
-
-
-"""
-@file optim.py
-@brief 训练阶段优化器与学习率调度器构造工具。
-       Utilities to build optimizer and LR scheduler for training.
-"""
-
-from __future__ import annotations
-
-from typing import Any, Optional, Tuple
-
-from torch import nn
-from torch.optim import AdamW, Optimizer
-from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
-
-from kan.utils.logging import get_logger
-
-logger = get_logger(__name__)
 
 
 def build_optimizer(config: Any, model: nn.Module) -> Optimizer:
