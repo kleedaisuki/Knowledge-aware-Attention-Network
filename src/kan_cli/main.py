@@ -210,7 +210,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     logger = get_logger(__name__)
-    logger.info("[cli] Parsed arguments: %s", args)
+    logger.info("Parsed arguments: %s", args)
 
     # 1) 加载 ExperimentConfig
     cfg = _load_config(args.config)
@@ -220,7 +220,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         config=cfg,
         work_dir=args.work_dir,
         override_device=args.device,
-        logger=logger,
+        logger=get_logger("cli-runtime"),
     )
 
     # 3) 根据子命令收集任务参数

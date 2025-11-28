@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+import logging
 from typing import Any, Callable, ClassVar, Dict, List, Optional, Type, TypeVar
 
 import torch
@@ -175,9 +176,7 @@ class TaskRegistry:
         if task_name in self._tasks:
             # 为了方便实验，允许覆盖，但记录告警
             logger = get_logger(__name__)
-            logger.warning(
-                f"[runtime] Task '{task_name}' is already registered; overriding."
-            )
+            logger.warning(f"Task '{task_name}' is already registered; overriding.")
 
         self._tasks[task_name] = task_cls
         return task_cls
@@ -261,7 +260,7 @@ class ExperimentRuntime:
     device: torch.device
     """@brief 计算设备。Compute device."""
 
-    logger: Any
+    logger: "logging.Logger"
     """@brief 日志记录器实例。Logger instance."""
 
     state: RuntimeState = field(default=RuntimeState.INIT)
@@ -295,7 +294,7 @@ class ExperimentRuntime:
         """
         if self.state == RuntimeState.FAILED and new_state == RuntimeState.RUNNING:
             raise RuntimeError("Cannot transition from FAILED to RUNNING directly.")
-        self.logger.info(f"[runtime] State: {self.state.value} -> {new_state.value}")
+        self.logger.info(f"State: {self.state.value} -> {new_state.value}")
         self.state = new_state
 
     # ----------------------
@@ -322,10 +321,10 @@ class ExperimentRuntime:
             and self._val_loader is None
             and self._test_loader is None
         ):
-            self.logger.info("[runtime] Building all dataloaders...")
+            self.logger.info("Building all dataloaders...")
             train, val, test = build_all_dataloaders(self.config)
             self._train_loader, self._val_loader, self._test_loader = train, val, test
-            self.logger.info("[runtime] Dataloaders built.")
+            self.logger.info("Dataloaders built.")
         return self._train_loader, self._val_loader, self._test_loader
 
     @property
@@ -369,7 +368,7 @@ class ExperimentRuntime:
                (config, work_dir, train_loader, build_if_missing).
         """
         if self._text_vocab is None or self._entity_vocab is None:
-            self.logger.info("[runtime] Loading/building vocabs...")
+            self.logger.info("Loading/building vocabs...")
             train_loader, _, _ = self.get_dataloaders()
             self._text_vocab, self._entity_vocab = build_or_load_vocabs(
                 config=self.config,
@@ -377,7 +376,7 @@ class ExperimentRuntime:
                 train_loader=train_loader,
                 build_if_missing=build_if_missing,
             )
-            self.logger.info("[runtime] Vocabs ready.")
+            self.logger.info("Vocabs ready.")
         return self._text_vocab, self._entity_vocab
 
     def get_batcher(self, build_if_missing: bool = True) -> Any:
@@ -396,14 +395,14 @@ class ExperimentRuntime:
                recommended to accept (config, text_vocab, entity_vocab).
         """
         if self._batcher is None and build_if_missing:
-            self.logger.info("[runtime] Building batcher...")
+            self.logger.info("Building batcher...")
             text_vocab, entity_vocab = self.get_vocabs(build_if_missing=True)
             self._batcher = build_batcher(
                 config=self.config,
                 text_vocab=text_vocab,
                 entity_vocab=entity_vocab,
             )
-            self.logger.info("[runtime] Batcher built.")
+            self.logger.info("Batcher built.")
         return self._batcher
 
     # ----------------------
@@ -426,22 +425,20 @@ class ExperimentRuntime:
                 Model instance (already moved to self.device).
         """
         if self._model is None or rebuild:
-            self.logger.info("[runtime] Building model from config...")
+            self.logger.info("Building model from config...")
             self._model = build_model_from_config(self.config).to(self.device)
-            self.logger.info("[runtime] Model built.")
+            self.logger.info("Model built.")
 
         if checkpoint is not None:
             ckpt_path = Path(checkpoint)
             if ckpt_path.is_file():
-                self.logger.info(f"[runtime] Loading checkpoint from {ckpt_path}...")
+                self.logger.info(f"Loading checkpoint from {ckpt_path}...")
                 state = torch.load(ckpt_path, map_location=self.device)
                 # 这里假定 checkpoint 中 key 为 "model"
                 self._model.load_state_dict(state["model"])
-                self.logger.info("[runtime] Checkpoint loaded.")
+                self.logger.info("Checkpoint loaded.")
             else:
-                self.logger.warning(
-                    f"[runtime] Checkpoint not found: {ckpt_path}, skip loading."
-                )
+                self.logger.warning(f"Checkpoint not found: {ckpt_path}, skip loading.")
 
         return self._model
 
@@ -458,9 +455,9 @@ class ExperimentRuntime:
         if self._optimizer is None or rebuild:
             if self._model is None:
                 raise RuntimeError("Model must be built before building optimizer.")
-            self.logger.info("[runtime] Building optimizer...")
+            self.logger.info("Building optimizer...")
             self._optimizer = build_optimizer(self.config, self._model)
-            self.logger.info("[runtime] Optimizer built.")
+            self.logger.info("Optimizer built.")
         return self._optimizer
 
     def get_scheduler(self, rebuild: bool = False) -> Optional[_LRScheduler]:
@@ -478,12 +475,12 @@ class ExperimentRuntime:
             if self._optimizer is None:
                 # 若未配置调度器，可直接返回 None
                 if not getattr(self.config.training, "use_scheduler", False):
-                    self.logger.info("[runtime] Scheduler disabled by config.")
+                    self.logger.info("Scheduler disabled by config.")
                     return None
                 raise RuntimeError("Optimizer must be built before building scheduler.")
-            self.logger.info("[runtime] Building scheduler...")
+            self.logger.info("Building scheduler...")
             self._scheduler = build_scheduler(self.config, self._optimizer)
-            self.logger.info("[runtime] Scheduler built.")
+            self.logger.info("Scheduler built.")
         return self._scheduler
 
 
@@ -532,7 +529,7 @@ def create_runtime(
     set_global_seed(seed)
 
     logger.info(
-        f"[runtime] Initialize runtime: work_dir={work_dir}, device={device}, seed={seed}"
+        f"Initialize runtime: work_dir={work_dir}, device={device}, seed={seed}"
     )
 
     runtime = ExperimentRuntime(
@@ -580,9 +577,7 @@ def run_task(
             f"{[s.value for s in task_cls.allowed_start_states]}",
         )
 
-    runtime.logger.info(
-        f"[runtime] Starting task '{task_name}' with kwargs={task_kwargs}."
-    )
+    runtime.logger.info(f"Starting task '{task_name}' with kwargs={task_kwargs}.")
 
     task = task_cls(runtime, **task_kwargs)
 
@@ -595,13 +590,11 @@ def run_task(
         result = task.run()
         task.after_run(result)
         runtime.transition_to(RuntimeState.COMPLETED)
-        runtime.logger.info(f"[runtime] Task '{task_name}' completed successfully.")
+        runtime.logger.info(f"Task '{task_name}' completed successfully.")
         return result
     except Exception as exc:
         runtime.transition_to(RuntimeState.FAILED)
-        runtime.logger.error(
-            f"[runtime] Task '{task_name}' failed: {exc}", exc_info=True
-        )
+        runtime.logger.error(f"Task '{task_name}' failed: {exc}", exc_info=True)
         # 是否重新抛出由你决定，此处选择重抛以便 CLI 可感知错误
         raise
     finally:

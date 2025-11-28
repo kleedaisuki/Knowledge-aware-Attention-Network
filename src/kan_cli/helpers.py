@@ -3,7 +3,10 @@ from kan import get_logger
 logger = get_logger(__name__)
 
 
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple, Sequence, TypeVar
+
+_T = TypeVar("_T")
+
 import json
 from pathlib import Path
 
@@ -32,6 +35,25 @@ from kan import (
     NewsSample,
     ExperimentConfig,
 )
+
+
+def identity_collate(batch: Sequence[_T]) -> Sequence[_T]:
+    """
+    @brief DataLoader 批次恒等聚合函数：保持 batch 为原始序列，不做任何拼接或转换。
+           Identity collate function for DataLoader: keep the batch as the
+           original sequence of samples without stacking or transformation.
+
+    @param batch 一个样本序列，例如 List[PreprocessedSample]。
+           A sequence of samples, e.g. List[PreprocessedSample].
+    @return 与输入完全相同的 batch 序列。
+            Exactly the same batch sequence as the input.
+    @note 适用于我们希望由上层组件（如 kan.repr.Batcher）负责将
+          PreprocessedSample 列表转换为张量批次的场景。
+          Suitable when upper-layer components (e.g. kan.repr.Batcher) are
+          responsible for converting a list of PreprocessedSample into tensor
+          batches.
+    """
+    return batch
 
 
 class PreprocessedDataset(Dataset):
@@ -129,6 +151,7 @@ def build_all_dataloaders(
         preprocessed_dataset,
         batch_size=ds_cfg.batch_size,
         shuffle=ds_cfg.shuffle,
+        collate_fn=identity_collate,
     )
 
     # 未来扩展：可以根据 config.dataset_{train,val,test} 构建更多 DataLoader
@@ -144,19 +167,30 @@ def _iter_preprocessed_samples(
     """
     @brief 辅助函数：从任意可迭代 train_loader 中抽取 PreprocessedSample。
            Helper to extract PreprocessedSample objects from a generic iterable loader.
-    @param train_loader 训练数据迭代器，元素应为 PreprocessedSample。
-           Training data iterable; elements are expected to be PreprocessedSample.
+    @param train_loader 训练数据迭代器，元素可以是 PreprocessedSample 或其列表批次。
+           Training data iterable; elements can be PreprocessedSample or batches of them.
     @return 逐个产出 PreprocessedSample 的生成器。Generator yielding PreprocessedSample.
     @throws TypeError 如元素类型不符合预期。
             Raises TypeError if element types are unsupported.
     """
     for item in train_loader:
         if isinstance(item, PreprocessedSample):
+            # 单条样本
             yield item
+        elif isinstance(item, (list, tuple)):
+            # batch 内的每一个元素
+            for sub in item:
+                if isinstance(sub, PreprocessedSample):
+                    yield sub
+                else:
+                    raise TypeError(
+                        "Unsupported element type inside batch when iterating "
+                        f"PreprocessedSample: {type(sub)!r}"
+                    )
         else:
             raise TypeError(
                 "build_or_load_vocabs currently expects train_loader to yield "
-                "PreprocessedSample instances; got "
+                "PreprocessedSample instances or batches thereof; got "
                 f"{type(item)!r}. You may need to adjust your pipeline."
             )
 
@@ -358,7 +392,7 @@ def build_optimizer(config: Any, model: nn.Module) -> Optimizer:
     weight_decay = getattr(training_cfg, "weight_decay", 0.0)
 
     logger.info(
-        "[optim] Building AdamW optimizer: lr=%.3e, weight_decay=%.2e",
+        "Building AdamW optimizer: lr=%.3e, weight_decay=%.2e",
         lr,
         weight_decay,
     )
@@ -389,7 +423,7 @@ def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]
     """
     training_cfg = getattr(config, "training", None)
     if training_cfg is None:
-        logger.info("[optim] No training config; scheduler disabled.")
+        logger.info("No training config; scheduler disabled.")
         return None
 
     use_scheduler = getattr(training_cfg, "use_scheduler", False)
@@ -397,7 +431,7 @@ def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]
 
     if not use_scheduler or warmup_steps <= 0:
         logger.info(
-            "[optim] Scheduler disabled (use_scheduler=%s, warmup_steps=%d).",
+            "Scheduler disabled (use_scheduler=%s, warmup_steps=%d).",
             use_scheduler,
             warmup_steps,
         )
@@ -410,5 +444,5 @@ def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]
             return float(step) / float(max(1, warmup_steps))
         return 1.0
 
-    logger.info("[optim] Using linear warmup scheduler: warmup_steps=%d", warmup_steps)
+    logger.info("Using linear warmup scheduler: warmup_steps=%d", warmup_steps)
     return LambdaLR(optimizer, lr_lambda=lr_lambda)

@@ -38,7 +38,7 @@ def _create_formatter() -> logging.Formatter:
     @note 时间戳格式为: YYYY-MM-DD-HH:MM:SS.microseconds
           Timestamp format: YYYY-MM-DD-HH:MM:SS.microseconds
     """
-    fmt = "%(asctime)s-%(levelname)s-%(name)s-%(message)s"
+    fmt = "[%(asctime)s] %(levelname)s @{%(name)s}: %(message)s"
 
     class MicrosecondFormatter(logging.Formatter):
         def formatTime(self, record, datefmt=None):
@@ -46,7 +46,7 @@ def _create_formatter() -> logging.Formatter:
 
             dt = datetime.fromtimestamp(record.created)
             # 强制格式：YYYY-MM-DD-HH:MM:SS.microseconds（无空格）
-            return "[" + dt.strftime("%Y-%m-%d-%H:%M:%S.") + f"{dt.microsecond:06d}]"
+            return dt.strftime("%Y-%m-%d-%H:%M:%S.") + f"{dt.microsecond:06d}"
 
     return MicrosecondFormatter(fmt)
 

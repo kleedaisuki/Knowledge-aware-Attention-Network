@@ -14,15 +14,17 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+from torch import Tensor
 from torch.nn import functional as F  # noqa: F401  # 预留给未来可能的扩展
 from torch.utils.data import DataLoader
 
+import kan
 from kan import get_logger
+from kan.repr.batching import BatchEncoding
 
 from kan_cli.runtime import (
     ExperimentRuntime,
     ExperimentTask,
-    RuntimeState,  # noqa: F401  # 目前未直接使用，保留作类型语义
     register_task,
 )
 
@@ -49,91 +51,148 @@ def _move_to_device(obj: Any, device: torch.device) -> Any:
     return obj
 
 
+def _from_batch_encoding(
+    batch: BatchEncoding,
+    device: torch.device,
+) -> Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[List[Any]]]:
+    """
+    @brief 从 BatchEncoding 抽取模型输入、标签和 ID，并搬到目标设备。
+           Extract model inputs, labels and IDs from a BatchEncoding and move
+           them onto the target device.
+    """
+    model_inputs: Dict[str, Any] = {
+        "token_ids": batch.token_ids,
+        "token_padding_mask": batch.token_padding_mask,
+    }
+
+    if batch.entity_ids is not None:
+        model_inputs["entity_ids"] = batch.entity_ids
+    if batch.entity_padding_mask is not None:
+        model_inputs["entity_padding_mask"] = batch.entity_padding_mask
+    if batch.context_ids is not None:
+        model_inputs["context_ids"] = batch.context_ids
+    if batch.context_padding_mask is not None:
+        model_inputs["context_padding_mask"] = batch.context_padding_mask
+
+    labels: Optional[torch.Tensor] = batch.labels
+    if labels is not None:
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.as_tensor(labels, dtype=torch.float32)
+        else:
+            labels = labels.to(dtype=torch.float32)
+
+    ids_list: Optional[List[Any]] = None
+    if batch.ids is not None:
+        ids_list = batch.ids.detach().cpu().tolist()
+
+    model_inputs = _move_to_device(model_inputs, device)
+    if labels is not None:
+        labels = labels.to(device=device)
+
+    return model_inputs, labels, ids_list
+
+
 def _extract_batch_io(
     batcher: Any,
     raw_batch: Any,
     device: torch.device,
-) -> Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[List[Any]]]:
+) -> Tuple[Dict[str, Any], Optional[Tensor], Optional[List[Any]]]:
     """
     @brief 从原始 batch 中抽取模型输入、标签和样本 ID。
            Extract model inputs, labels and sample IDs from a raw batch.
-    @param batcher Batcher 实例，用于自定义拆解逻辑。
-           Batcher instance, allowed to customize how batch is interpreted.
-    @param raw_batch DataLoader 产出的原始 batch。
-           Raw batch object yielded by the DataLoader.
+    @param batcher Batcher 实例，目前主要用于与 DataLoader 集成以及从
+                   PreprocessedSample 序列构造 BatchEncoding。
+           Batcher instance, mainly used as DataLoader collate_fn and to build
+           BatchEncoding from a sequence of PreprocessedSample.
+    @param raw_batch DataLoader 产出的原始 batch；当前项目中要么为
+                     BatchEncoding，要么为 List[PreprocessedSample]。
+           Raw batch yielded by the DataLoader; in this project it is either a
+           BatchEncoding or a List[PreprocessedSample].
     @param device 目标设备。Target device.
     @return (model_inputs, labels, ids) 三元组；labels/ids 可能为 None。
             A triple (model_inputs, labels, ids); labels/ids may be None.
 
     @note
-        为了尽量降低对 Batcher 实现细节的假设，本函数按以下优先级解析 batch：
-        To minimize reliance on Batcher internals, the function interprets batch
-        using the following priority:
+        解析优先级（从高到低）如下：
+        The interpretation priority is:
 
-        1) 若 batcher 实现了 to_model_inputs / get_labels / get_ids，则优先使用。
-           If batcher implements to_model_inputs / get_labels / get_ids, use them.
-        2) 否则，若 raw_batch 是 dict，则：
-           Otherwise, if raw_batch is a dict:
-           - model_inputs 取 raw_batch["model_inputs"] 或除 label/id 外的键；
-             model_inputs = raw_batch["model_inputs"] or all keys except label/id.
-           - labels 尝试查找 "labels"/"label"/"y"。
-           - ids 尝试查找 "ids"/"id"。
-        3) 否则，若 raw_batch 是 (inputs, labels[, ids]) 元组/列表，则按位置取。
-           Otherwise, if raw_batch is a tuple/list (inputs, labels[, ids]), use indices.
+        1) 若 raw_batch 是 BatchEncoding，直接展开为模型输入/标签/ID。
+           If raw_batch is a BatchEncoding, unpack it directly.
+        2) 若 raw_batch 是 List[PreprocessedSample]，通过 batcher(raw_batch)
+           构造 BatchEncoding 再展开。
+           If raw_batch is a List[PreprocessedSample], call batcher(raw_batch)
+           to build a BatchEncoding and then unpack.
+        3) 其他情况：保留一个轻量回退逻辑（dict + batcher.to_model_inputs）
+           以兼容未来扩展或旧代码。
+           Otherwise: use a light fallback (dict + batcher.to_model_inputs) for
+           extensibility / legacy code.
     """
-    # 1) Batcher 显式方法 Explicit methods on batcher
-    if hasattr(batcher, "to_model_inputs"):
-        model_inputs = batcher.to_model_inputs(raw_batch)
-    else:
-        model_inputs = None
+    # ============================================================
+    # 1) 正常路径：raw_batch 已经是 BatchEncoding
+    #    Normal path: raw_batch is already a BatchEncoding.
+    # ============================================================
+    if isinstance(raw_batch, BatchEncoding):
+        return _from_batch_encoding(raw_batch, device)
 
-    labels: Optional[torch.Tensor] = None
+    # ============================================================
+    # 1.5) 当前项目的实际情况：raw_batch 是 List[PreprocessedSample]
+    #      DataLoader 使用 identity_collate，真正的 batching 由 Batcher 完成。
+    #      In this project, raw_batch is List[PreprocessedSample] because
+    #      DataLoader uses identity_collate and Batcher does the batching.
+    # ============================================================
+    PreprocessedSample = kan.PreprocessedSample
+    if isinstance(raw_batch, (list, tuple)) and raw_batch:
+        first = raw_batch[0]
+        if isinstance(first, PreprocessedSample):
+            batch_encoding = batcher(raw_batch)
+            if not isinstance(batch_encoding, BatchEncoding):
+                raise TypeError(
+                    f"Batcher(collate) is expected to return BatchEncoding, "
+                    f"got {type(batch_encoding)!r}"
+                )
+            return _from_batch_encoding(batch_encoding, device)
+
+    # ============================================================
+    # 2) 回退逻辑：兼容非 BatchEncoding 的情况（例如未来扩展）
+    #    Fallback logic for non-BatchEncoding batches.
+    # ============================================================
+    # 2.1 尝试 batcher 提供的通用接口（若存在）
+    #     Try generic methods on batcher if available.
+    if hasattr(batcher, "to_model_inputs"):
+        model_inputs: Any = batcher.to_model_inputs(raw_batch)
+    else:
+        model_inputs = raw_batch
+
+    labels: Optional[Tensor] = None
     ids: Optional[List[Any]] = None
 
     if hasattr(batcher, "get_labels"):
         labels = batcher.get_labels(raw_batch)  # type: ignore[assignment]
     if hasattr(batcher, "get_ids"):
-        ids = list(batcher.get_ids(raw_batch))  # type: ignore[arg-type]
+        got_ids = batcher.get_ids(raw_batch)  # type: ignore[assignment]
+        if got_ids is not None:
+            ids = list(got_ids)
 
-    # 2) 基于 dict 结构的回退 Fallback for dict-like batches
-    if model_inputs is None:
-        if isinstance(raw_batch, dict):
-            if "model_inputs" in raw_batch:
-                model_inputs = raw_batch["model_inputs"]
-            else:
-                # 过滤掉 label/id 字段
-                exclude = {"label", "labels", "y", "id", "ids"}
-                model_inputs = {k: v for k, v in raw_batch.items() if k not in exclude}
-        elif isinstance(raw_batch, (list, tuple)) and raw_batch:
-            # 3) (inputs, labels[, ids]) 风格
-            model_inputs = raw_batch[0]
-        else:
-            # 最后兜底就直接当成输入
-            model_inputs = raw_batch
+    # 2.2 若 labels/ids 仍为空，对 dict 做温和兜底
+    #     Gentle fallback for dict-shaped batches.
+    if labels is None and isinstance(raw_batch, dict):
+        for key in ("labels", "label", "y"):
+            if key in raw_batch:
+                labels = raw_batch[key]  # type: ignore[assignment]
+                break
 
-    if labels is None:
-        if isinstance(raw_batch, dict):
-            for key in ("labels", "label", "y"):
-                if key in raw_batch:
-                    labels = raw_batch[key]
-                    break
-        elif isinstance(raw_batch, (list, tuple)) and len(raw_batch) >= 2:
-            labels = raw_batch[1]
+    if ids is None and isinstance(raw_batch, dict):
+        if "ids" in raw_batch:
+            ids = list(raw_batch["ids"])
+        elif "id" in raw_batch:
+            ids = list(raw_batch["id"])
 
-    if ids is None:
-        if isinstance(raw_batch, dict):
-            if "ids" in raw_batch:
-                ids = list(raw_batch["ids"])
-            elif "id" in raw_batch:
-                ids = list(raw_batch["id"])
-        elif isinstance(raw_batch, (list, tuple)) and len(raw_batch) >= 3:
-            ids = list(raw_batch[2])
-
-    # 统一张量类型 & 设备 Normalize tensors & device
+    # 2.3 统一搬到设备，并规范 labels 类型
+    #     Normalize device and label dtype.
     model_inputs = _move_to_device(model_inputs, device)
-    if labels is not None and not isinstance(labels, torch.Tensor):
+    if labels is not None and not isinstance(labels, Tensor):
         labels = torch.as_tensor(labels, dtype=torch.float32, device=device)
-    elif isinstance(labels, torch.Tensor):
+    elif isinstance(labels, Tensor):
         labels = labels.to(device=device, dtype=torch.float32)
 
     return model_inputs, labels, ids
@@ -236,7 +295,7 @@ class TrainTask(ExperimentTask):
         scheduler = runtime.get_scheduler()
 
         runtime.logger.info(
-            "[train] Start training: epochs=%d, grad_clip=%.3f, device=%s",
+            "Start training: epochs=%d, grad_clip=%.3f, device=%s",
             num_epochs,
             grad_clip,
             runtime.device,
@@ -287,7 +346,7 @@ class TrainTask(ExperimentTask):
 
             avg_loss = epoch_loss / max(1, epoch_samples)
             runtime.logger.info(
-                "[train] Epoch %d/%d finished: avg_loss=%.6f, samples=%d",
+                "Epoch %d/%d finished: avg_loss=%.6f, samples=%d",
                 epoch,
                 num_epochs,
                 avg_loss,
@@ -311,7 +370,7 @@ class TrainTask(ExperimentTask):
             ckpt_path,
         )
         runtime.logger.info(
-            "[train] Training completed, checkpoint saved to %s",
+            "Training completed, checkpoint saved to %s",
             ckpt_path.as_posix(),
         )
         return ckpt_path

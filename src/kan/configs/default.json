@@ -96,14 +96,14 @@
         "weight_decay": 0.0,
         "warmup_steps": 0,
         "gradient_clip": 1.0,
-        "device": "cuda",
+        "device": "cpu",
         "seed": 42,
         "output_dir": "train/models/weibo",
         "log_dir": "train/logs/weibo",
         "save_every": 1
     },
     "evaluation": {
-        "device": "cuda",
+        "device": "cpu",
         "seed": 42,
         "checkpoint_path": null,
         "results_csv": "train/results/results.csv",
