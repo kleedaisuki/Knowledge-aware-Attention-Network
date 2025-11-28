@@ -60,8 +60,11 @@ Knowledge-aware-Attention-Network/
 │   └─ kg_cache/      
 │
 ├─ train/
-│   ├─ models/
-│   └─ logs/
+│   ├── logs/               # 日志文件
+│   ├── models/             # checkpoint
+│   ├── vocabs/             # text/entity vocab
+│   ├── preds/              # predict 输出
+│   └── metadata.json       # runtime 元信息
 │
 ├─ scripts/
 │   └─ install-dev.ps1

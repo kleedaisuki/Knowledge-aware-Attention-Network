@@ -39,10 +39,16 @@ def _create_formatter() -> logging.Formatter:
           Timestamp format: YYYY-MM-DD-HH:MM:SS.microseconds
     """
     fmt = "%(asctime)s-%(levelname)s-%(name)s-%(message)s"
-    # Python 3.11 支持 %f 微秒；这里用 '-' 连接日期和时间，且整体无空格
-    # Python 3.11 supports %f for microseconds; we use '-' between date and time and no spaces overall
-    datefmt = "%Y-%m-%d-%H:%M:%S.%f"
-    return logging.Formatter(fmt=fmt, datefmt=datefmt)
+
+    class MicrosecondFormatter(logging.Formatter):
+        def formatTime(self, record, datefmt=None):
+            from datetime import datetime
+
+            dt = datetime.fromtimestamp(record.created)
+            # 强制格式：YYYY-MM-DD-HH:MM:SS.microseconds（无空格）
+            return "[" + dt.strftime("%Y-%m-%d-%H:%M:%S.") + f"{dt.microsecond:06d}]"
+
+    return MicrosecondFormatter(fmt)
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:

@@ -13,6 +13,24 @@ from __future__ import annotations
 # ============================================================
 
 # ------------------------------
+# Utils 工具模块
+# ------------------------------
+from .utils import (  # type: ignore[F401]
+    load_config,
+    load_experiment_config,
+    get_logger,
+    info,
+    warn,
+    error,
+    BinaryClassificationMetrics,
+    compute_binary_classification_metrics,
+    log_metrics,
+    write_probability_csv,
+    set_global_seed,
+    ExperimentConfig,
+)
+
+# ------------------------------
 # Models 主模型与编码器
 # ------------------------------
 from .models import (  # type: ignore[F401]
@@ -73,24 +91,6 @@ from .training import (  # type: ignore[F401]
     EvaluationConfig,
     Trainer,
     Evaluator,
-)
-
-# ------------------------------
-# Utils 工具模块
-# ------------------------------
-from .utils import (  # type: ignore[F401]
-    load_config,
-    load_experiment_config,
-    get_logger,
-    info,
-    warn,
-    error,
-    BinaryClassificationMetrics,
-    compute_binary_classification_metrics,
-    log_metrics,
-    write_probability_csv,
-    set_global_seed,
-    ExperimentConfig,
 )
 
 # ============================================================

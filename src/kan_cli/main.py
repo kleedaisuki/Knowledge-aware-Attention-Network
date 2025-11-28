@@ -1,29 +1,31 @@
 """
 @file main.py
-@brief KAN 命令行工具主入口，负责：
+@brief KAN 命令行入口。其职责严格限定为：
        1) 解析全局与子命令参数；
        2) 加载 ExperimentConfig；
-       3) 构建 ExperimentRuntime；
-       4) 通过任务注册表调度 train / evaluate / predict 等任务。
+       3) 构建 ExperimentRuntime（状态机 + 运行环境）；
+       4) 将控制权交给任务注册表，调度 train / evaluate / predict 等任务。
        Main entry for the KAN command-line interface, responsible for:
        1) parsing global and sub-command arguments;
        2) loading an ExperimentConfig;
-       3) constructing an ExperimentRuntime;
-       4) dispatching tasks (train / evaluate / predict) via the task registry.
+       3) constructing an ExperimentRuntime (state machine + runtime context);
+       4) delegating execution to tasks registered in the task registry.
 
-@param argv 可选的命令行参数列表，便于测试时注入；实际运行通常由 sys.argv 提供。
-       Optional list of command-line arguments, mainly for testing; in normal
-       usage this is populated from sys.argv.
+@param argv 可选的参数列表（便于测试时注入）；正常运行由 sys.argv 自动提供。
+       Optional list of command-line arguments (useful for testing); in normal
+       usage populated automatically from sys.argv.
 
 @note
-    * 本模块自身不再直接依赖具体的 train/evaluate/predict 实现，而是统一通过
-      kan_cli.runtime 中的状态机与任务注册表进行调度。
-      This module no longer depends directly on concrete train/evaluate/predict
-      implementations; instead, it uses the state machine and task registry in
-      kan_cli.runtime for dispatch.
-    * 具体任务应在其它模块中通过 @register_task("train") 等方式完成注册。
-      Concrete tasks should be registered elsewhere via @register_task("train"),
-      etc.
+    * main.py 不实现任何具体任务逻辑，也不直接依赖 train/evaluate/predict 的内部实现，
+      而是只负责“把任务名称与参数交给 state machine + registry”。
+      main.py contains no task-specific logic and does not depend on concrete
+      implementations; it simply delegates task execution to the state machine
+      and the registry.
+
+    * 所有任务均应在其它模块中通过 @register_task("train") 等装饰器注册，
+      以确保被 runtime 正确发现与调度。
+      All concrete tasks must be registered elsewhere via decorators such as
+      @register_task("train"), ensuring they are discoverable by the runtime.
 """
 
 from __future__ import annotations

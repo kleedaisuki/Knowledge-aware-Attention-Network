@@ -13,7 +13,7 @@ from torch import nn
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import LambdaLR, _LRScheduler
 
-
+import kan
 from kan import (
     Preprocessor,
     PreprocessConfig,
@@ -29,6 +29,8 @@ from kan import (
     Batcher,
     KANConfig,
     KAN,
+    NewsSample,
+    ExperimentConfig,
 )
 
 
@@ -80,7 +82,7 @@ def _build_preprocessed_dataset(
     logger.info(
         "Building preprocessed dataset from %s (num_samples=%d)",
         cfg_dataset.csv_path,
-        len(dataset),
+        len(dataset.samples),
     )
 
     # 2) 构造 KG 客户端（如启用）
@@ -91,8 +93,12 @@ def _build_preprocessed_dataset(
     preprocessor = Preprocessor(cfg_preprocess, kg_client=kg_client)
 
     # 3) 对全部样本做一次性预处理（简单实现，后续可改为惰性）
+    def _get_samples_from_news_dataset(dataset: NewsDataset) -> Iterable[NewsSample]:
+        for sample in dataset.samples:
+            yield sample
+
     preprocessed: list[PreprocessedSample] = preprocessor.preprocess_batch(
-        dataset.iter_all()
+        _get_samples_from_news_dataset(dataset)
     )
 
     logger.info("Preprocessed dataset built: %d samples", len(preprocessed))
@@ -168,8 +174,8 @@ def build_or_load_vocabs(
            Experiment config expected to have text_vocab / entity_vocab fields.
     @param work_dir 实验工作目录，用于存放 vocabs/ 子目录。
            Working directory where vocabs/ subdirectory will be created.
-    @param train_loader 训练数据迭代器，应产出 PreprocessedSample。
-           Training data iterable expected to yield PreprocessedSample instances.
+    @param train_loader 训练数据迭代器，通常是 DataLoader，也可直接是预处理数据集。
+           Training data iterable, usually a DataLoader, or a preprocessed dataset.
     @param build_if_missing 若为 True，在无现有词表时从训练数据构建新词表。
            If True, build new vocabs from training data when files are missing.
     @return (text_vocab, entity_vocab) 二元组。
@@ -203,9 +209,23 @@ def build_or_load_vocabs(
         )
 
     # ---------- 情况 2：从训练数据构建新词表 ----------
-    logger.info("Building new vocabs from training data...")
+    # 优先从 DataLoader.dataset 取出预处理后的数据集本体，避免 default_collate
+    if hasattr(train_loader, "dataset"):
+        dataset = train_loader.dataset
+        logger.info(
+            "Building new vocabs from dataset attached to train_loader: %s",
+            type(dataset).__name__,
+        )
+    else:
+        # 兜底：如果传进来的本身就是一个 iterable of PreprocessedSample
+        dataset = train_loader
+        logger.info(
+            "Building new vocabs from generic training iterable: %s",
+            type(dataset).__name__,
+        )
 
-    samples = list(_iter_preprocessed_samples(train_loader))
+    # 这里直接遍历“样本级别”的 dataset，不再触发 DataLoader 的 default_collate
+    samples = list(dataset)
     if not samples:
         raise RuntimeError("No training samples found when building vocabularies.")
 
@@ -266,10 +286,7 @@ def build_batcher(
     )
 
 
-from typing import Any
-
-
-def build_model_from_config(config: Any) -> KAN:
+def build_model_from_config(config: ExperimentConfig) -> KAN:
     """
     @brief 从 ExperimentConfig 构建 KAN 模型。
            Build a KAN model instance from an ExperimentConfig-like object.
@@ -281,9 +298,42 @@ def build_model_from_config(config: Any) -> KAN:
           This function builds only the core KAN network, without ID→embedding;
           higher-level code should compose TextEmbedding / EntityEmbedding with KAN.
     """
+    TextEncoderConfig = kan.models.kan.TextEncoderConfig
+    TransformerEncoderConfig = kan.models.transformer_encoder.TransformerEncoderConfig
+    KnowledgeEncoderConfig = kan.models.knowledge_encoder.KnowledgeEncoderConfig
+
+    # ---- 1) 处理 text encoder：统一成 TextEncoderConfig ----
+
+    raw_text_cfg = config.text_encoder
+
+    if isinstance(raw_text_cfg, TextEncoderConfig):
+        text_cfg = raw_text_cfg
+    elif isinstance(raw_text_cfg, TransformerEncoderConfig):
+        text_cfg = TextEncoderConfig(encoder=raw_text_cfg)
+    else:
+        raise TypeError(
+            f"ExperimentConfig.text_encoder 类型非法: {type(raw_text_cfg)}，"
+            "期望 TransformerEncoderConfig 或 TextEncoderConfig。"
+        )
+
+    # ---- 2) 处理 knowledge encoder：统一成 KnowledgeEncoderConfig ----
+    raw_kg_cfg = config.knowledge_encoder
+
+    if isinstance(raw_kg_cfg, KnowledgeEncoderConfig):
+        kg_cfg = raw_kg_cfg
+    elif isinstance(raw_kg_cfg, TransformerEncoderConfig):
+        # 如果你将来允许直接用一个 TransformerEncoderConfig 作为知识编码器，也可以这样包装
+        kg_cfg = KnowledgeEncoderConfig(encoder=raw_kg_cfg)
+    else:
+        raise TypeError(
+            f"ExperimentConfig.knowledge_encoder 类型非法: {type(raw_kg_cfg)}，"
+            "期望 KnowledgeEncoderConfig 或 TransformerEncoderConfig。"
+        )
+
+    # ---- 3) 组装 KANConfig ----
     kan_cfg = KANConfig(
-        text=config.text_encoder,
-        knowledge=config.knowledge_encoder,
+        text=text_cfg,
+        knowledge=kg_cfg,
         attention=config.attention,
         # num_classes / final_dropout 使用 KANConfig 自身默认值，
         # 如需覆盖，可在 ExperimentConfig 中扩展相应字段后在此读取。

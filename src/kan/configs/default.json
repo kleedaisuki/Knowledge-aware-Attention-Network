@@ -1,6 +1,6 @@
 {
     "dataset": {
-        "csv_path": "data/train.csv",
+        "csv_path": "data/news/train.csv",
         "batch_size": 32,
         "shuffle": true,
         "text_field": "text",
