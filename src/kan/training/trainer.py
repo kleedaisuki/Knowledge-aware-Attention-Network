@@ -84,7 +84,8 @@ class Trainer:
         """
         @brief 构造 Trainer 实例。
                Construct a Trainer instance.
-        @param model 待训练的 PyTorch 模型（例如 KAN）。Model to train (e.g. KAN).
+        @param model 待训练的 PyTorch 模型（例如 KAN）。
+               Model to train (e.g. KAN with integrated embeddings).
         @param train_data 可迭代的训练 batch 序列，每个 batch 为 BatchEncoding。
                Iterable of training batches, each a BatchEncoding instance.
         @param cfg TrainingConfig 训练配置。Training configuration.
@@ -98,6 +99,9 @@ class Trainer:
 
         self._set_seed(cfg.seed)
 
+        # 二分类任务：对“正类”logit 使用 BCEWithLogitsLoss。
+        # We treat fake-news as positive class and use BCEWithLogitsLoss
+        # on the positive-class logit extracted from model outputs.
         self.criterion = nn.BCEWithLogitsLoss()
 
         self.optimizer = AdamW(
@@ -109,6 +113,7 @@ class Trainer:
         os.makedirs(self.cfg.output_dir, exist_ok=True)
         os.makedirs(self.cfg.log_dir, exist_ok=True)
 
+        logger.info("Trainer config: %s", asdict(self.cfg))
         logger.info(
             "Trainer initialized: epochs=%d, lr=%.3e, weight_decay=%.2e, "
             "warmup_steps=%d, grad_clip=%.3f, device=%s",
@@ -141,15 +146,25 @@ class Trainer:
 
     def _set_seed(self, seed: int) -> None:
         """
-        @brief 设置全局随机种子。
-               Set global random seed.
+        @brief 设置全局随机种子，优先使用项目内的 seed 工具。
+               Set global random seed, preferring the project's seed utility.
         @param seed 随机种子值。Random seed.
         """
-        from kan.utils import seed as seed_utils  # type: ignore[import-not-found]
+        try:
+            from kan.utils import seed as seed_utils  # type: ignore[import-not-found]
 
-        seed_utils.set_global_seed(seed)  # type: ignore[attr-defined]
-        logger.info("Global seed set via kan.utils.seed: %d", seed)
-        return
+            seed_utils.set_global_seed(seed)  # type: ignore[attr-defined]
+            logger.info("Global seed set via kan.utils.seed: %d", seed)
+        except Exception:  # noqa: BLE001
+            # 退化为简单的 torch / python 随机种子设置
+            # Fallback to basic torch-only seeding.
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            logger.info(
+                "Global seed set via torch.manual_seed (fallback): %d",
+                seed,
+            )
 
     # --------------------------------------------------------
     # Warmup 学习率调度（仅线性 warmup）
@@ -158,9 +173,7 @@ class Trainer:
         """
         @brief 依据 warmup_steps 更新学习率（线性从 0 → base_lr）。
                Update learning rate according to warmup_steps (linear 0 → base_lr).
-        @param global_step 当前已经执行的优化步数（从 1 开始）。Current global step (1-based).
-        @note 若 warmup_steps=0，则不做任何调整。
-              If warmup_steps=0, does nothing.
+        @param global_step 当前训练步数。Current global training step.
         """
         if self.cfg.warmup_steps <= 0:
             return
@@ -179,20 +192,66 @@ class Trainer:
             group["lr"] = lr
 
     # --------------------------------------------------------
-    # 训练主循环 Training Loop
+    # BatchEncoding → 设备上 BatchEncoding
+    # --------------------------------------------------------
+    def _batch_to_device(self, batch: BatchEncoding) -> BatchEncoding:
+        """
+        @brief 将 BatchEncoding 内的全部张量迁移到目标设备，返回新对象。
+               Move all tensors inside a BatchEncoding onto target device, return a new one.
+        @param batch 原始 batch。Original batch.
+        @return 新的、位于目标设备上的 BatchEncoding。New BatchEncoding on target device.
+        """
+        token_ids = batch.token_ids.to(self.device)
+        token_padding_mask = batch.token_padding_mask.to(self.device)
+
+        entity_ids = (
+            batch.entity_ids.to(self.device) if batch.entity_ids is not None else None
+        )
+        entity_padding_mask = (
+            batch.entity_padding_mask.to(self.device)
+            if batch.entity_padding_mask is not None
+            else None
+        )
+        context_ids = (
+            batch.context_ids.to(self.device) if batch.context_ids is not None else None
+        )
+        context_padding_mask = (
+            batch.context_padding_mask.to(self.device)
+            if batch.context_padding_mask is not None
+            else None
+        )
+
+        labels = batch.labels.to(self.device) if batch.labels is not None else None
+        ids = batch.ids.to(self.device)
+
+        return BatchEncoding(
+            token_ids=token_ids,
+            token_padding_mask=token_padding_mask,
+            entity_ids=entity_ids,
+            entity_padding_mask=entity_padding_mask,
+            context_ids=context_ids,
+            context_padding_mask=context_padding_mask,
+            labels=labels,
+            ids=ids,
+        )
+
+    # --------------------------------------------------------
+    # 外部接口：run 训练主循环
     # --------------------------------------------------------
     def train(self) -> None:
         """
-        @brief 执行完整训练流程，完成后在 output_dir 中写入若干模型权重文件。
-               Run the full training loop; writes model checkpoints to output_dir.
-        @note 本函数不做任何验证/测试，只打印训练 loss 并保存模型。
-              This function performs no validation/testing; only logs training
-              loss and saves model weights.
+        @brief 运行完整训练流程，按 epoch 遍历 train_data。
+               Run the full training loop over epochs and training data.
+        @note
+            * 该方法不做评估，只更新模型参数并按配置周期性保存 checkpoint。
+              This method performs pure training without evaluation, and periodically
+              saves checkpoints according to config.
         """
-        self.model.train()
         global_step = 0
 
         for epoch in range(1, self.cfg.num_epochs + 1):
+            logger.info("Epoch %d/%d started.", epoch, self.cfg.num_epochs)
+
             epoch_loss = 0.0
             num_batches = 0
 
@@ -200,9 +259,17 @@ class Trainer:
                 global_step += 1
                 self._update_learning_rate(global_step)
 
-                loss = self._train_one_batch(batch)
-                epoch_loss += loss
+                loss_val = self._train_one_batch(batch)
+                epoch_loss += loss_val
                 num_batches += 1
+
+                if global_step % 10 == 0:
+                    logger.info(
+                        "Step %d - batch_loss=%.6f, lr=%.6e",
+                        global_step,
+                        loss_val,
+                        self.optimizer.param_groups[0]["lr"],
+                    )
 
             avg_loss = epoch_loss / max(1, num_batches)
             logger.info(
@@ -228,70 +295,88 @@ class Trainer:
                One training batch; must be BatchEncoding with non-None labels.
         @return 当前 batch 的标量 loss 值（Python float）。
                 Scalar loss value for this batch (Python float).
+        @note
+            * 本函数假定模型接受单个 BatchEncoding 作为输入，即调用
+              `model(batch)` 或 `model(batch, ...)`。
+            * 若模型返回 `(logits, aux)` 元组，则仅使用第一个元素作为 logits；
+              若返回 Tensor，则直接视为 logits；若返回 dict，则要求包含 'logits'。
+            * 对二分类情况，若 logits 形状为 (B, 2)，则自动取第 1 类
+              （正类）对应的 logit 作为 BCEWithLogitsLoss 的输入。
         """
         if batch.labels is None:
             raise RuntimeError(
                 "BatchEncoding.labels is None; training requires labels."
             )
 
-        # ---------- 将 BatchEncoding 中的张量移动到目标设备 ----------
-        inputs: dict[str, Tensor] = {}
-
-        # 文本部分
-        inputs["token_ids"] = batch.token_ids.to(self.device)
-        inputs["token_padding_mask"] = batch.token_padding_mask.to(self.device)
-
-        # 实体 & 上下文部分（可能为空）
-        if batch.entity_ids is not None:
-            inputs["entity_ids"] = batch.entity_ids.to(self.device)
-        if batch.entity_padding_mask is not None:
-            inputs["entity_padding_mask"] = batch.entity_padding_mask.to(self.device)
-        if batch.context_ids is not None:
-            inputs["context_ids"] = batch.context_ids.to(self.device)
-        if batch.context_padding_mask is not None:
-            inputs["context_padding_mask"] = batch.context_padding_mask.to(self.device)
-
-        labels: Tensor = batch.labels.to(self.device)
+        batch_on_device = self._batch_to_device(batch)
 
         # ---------- 前向 + 反向 + 更新 ----------
         self.optimizer.zero_grad(set_to_none=True)
 
-        # 模型输出支持 Tensor 或 Mapping(logits=...)
-        outputs = self.model(**inputs)
+        outputs = self.model(batch_on_device)
 
-        if isinstance(outputs, dict):
-            if "logits" in outputs:
+        # 支持三种常见形式：
+        #   1) Tensor 直接为 logits
+        #   2) (logits, aux) 元组
+        #   3) 映射 {"logits": Tensor, ...}
+        if isinstance(outputs, Tensor):
+            logits = outputs
+        elif isinstance(outputs, tuple):
+            if not outputs:
+                raise RuntimeError("Model returned empty tuple, cannot get logits.")
+            logits = outputs[0]
+            if not isinstance(logits, Tensor):
+                raise RuntimeError(
+                    "First element of model output tuple is not a Tensor; "
+                    f"got type {type(logits)!r}."
+                )
+        elif isinstance(outputs, dict):
+            if "logits" in outputs and isinstance(outputs["logits"], Tensor):
                 logits = outputs["logits"]
             else:
-                # 若模型返回 dict 但不含 logits，则尝试取第一个 Tensor 项
-                logits = next(
-                    (v for v in outputs.values() if isinstance(v, Tensor)),
-                    None,
+                raise RuntimeError(
+                    "Model output dict must contain a Tensor under key 'logits'."
                 )
-                if logits is None:
-                    raise RuntimeError(
-                        "Model output mapping does not contain 'logits' "
-                        "nor any Tensor values."
-                    )
-        elif isinstance(outputs, Tensor):
-            logits = outputs
         else:
             raise RuntimeError(
-                f"Unsupported model output type: {type(outputs)!r}, "
-                "expected Tensor or Mapping."
+                f"Unsupported model output type: {type(outputs)!r}; "
+                "expected Tensor, tuple, or dict with a 'logits' Tensor."
             )
 
-        # BCEWithLogitsLoss 期望 float 目标
-        labels_float = labels.float().view(-1)
-        logits_flat = logits.view(-1)
-
-        if logits_flat.shape != labels_float.shape:
+        # ---------- 处理二分类 logit 形状 ----------
+        # 典型情况：
+        #   * (B, 2) → 取第 1 维作为正类 logit
+        #   * (B, 1) → squeeze 到 (B,)
+        #   * (B,)   → 直接使用
+        if logits.dim() == 2:
+            if logits.size(1) == 2:
+                logits_pos = logits[:, 1]
+            elif logits.size(1) == 1:
+                logits_pos = logits[:, 0]
+            else:
+                raise RuntimeError(
+                    "For 2D logits, expected shape (B, 1) or (B, 2); "
+                    f"got {tuple(logits.shape)}."
+                )
+        elif logits.dim() == 1:
+            logits_pos = logits
+        else:
             raise RuntimeError(
-                f"Logits and labels shape mismatch: {tuple(logits_flat.shape)} "
-                f"vs {tuple(labels_float.shape)}"
+                "Unsupported logits tensor shape for BCEWithLogitsLoss; "
+                f"got {tuple(logits.shape)}."
             )
 
-        loss = self.criterion(logits_flat, labels_float)
+        # BCEWithLogitsLoss 期望 float 目标，形状与 logits 一致
+        labels = batch_on_device.labels
+        assert labels is not None  # for mypy / type-checkers
+        labels_float = labels.float()
+        if labels_float.shape != logits_pos.shape:
+            raise RuntimeError(
+                "Logits and labels shape mismatch: "
+                f"{tuple(logits_pos.shape)} vs {tuple(labels_float.shape)}"
+            )
+
+        loss = self.criterion(logits_pos, labels_float)
         loss.backward()
 
         # 可选梯度裁剪
@@ -313,7 +398,7 @@ class Trainer:
         """
         ckpt_path = os.path.join(self.cfg.output_dir, f"epoch{epoch}.pt")
 
-        # 只保存必要信息：模型参数 + 训练配置
+        # 只保存必要信息：模型参数 + 训练配置 + 当前 epoch
         state = {
             "model_state_dict": self.model.state_dict(),
             "training_config": asdict(self.cfg),

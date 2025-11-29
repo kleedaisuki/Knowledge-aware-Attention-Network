@@ -11,7 +11,18 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 import logging
-from typing import Any, Callable, ClassVar, Dict, List, Optional, Type, TypeVar
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+)
 
 import torch
 from torch import nn
@@ -27,11 +38,11 @@ from kan_cli.helpers import (
     build_all_dataloaders,
     build_or_load_vocabs,
     build_batcher,
-    build_model_from_config,
+    build_batched_dataloaders,
+    build_kan_with_embeddings,
     build_optimizer,
     build_scheduler,
 )
-
 
 # ============================================================
 # 状态机定义 Runtime State Machine
@@ -108,7 +119,6 @@ class ExperimentTask:
         @brief 任务开始前的钩子，可选重写。
                Optional hook executed before task.run().
         """
-        # 默认不做任何事 Default: do nothing
         return
 
     def after_run(self, result: Any) -> None:
@@ -118,7 +128,6 @@ class ExperimentTask:
 
         @param result 任务返回结果。Task return value.
         """
-        # 默认不做任何事 Default: do nothing
         return
 
     def run(self) -> Any:  # pragma: no cover - abstract by convention
@@ -130,9 +139,9 @@ class ExperimentTask:
                 Task execution result, arbitrary type.
 
         @note  建议实现时使用 runtime 提供的接口，如
-               runtime.get_model() / runtime.get_dataloaders() 等。
-               It is recommended to use runtime methods such as
-               runtime.get_model() / runtime.get_dataloaders() etc.
+               runtime.train_loader / runtime.get_model() 等。
+               It is recommended to use runtime helpers such as
+               runtime.train_loader / runtime.get_model(), etc.
         """
         raise NotImplementedError(
             "ExperimentTask.run() must be implemented by subclasses."
@@ -174,9 +183,8 @@ class TaskRegistry:
             raise ValueError("Task class must define a non-empty 'task_name'.")
 
         if task_name in self._tasks:
-            # 为了方便实验，允许覆盖，但记录告警
             logger = get_logger(__name__)
-            logger.warning(f"Task '{task_name}' is already registered; overriding.")
+            logger.warning("Task '%s' is already registered; overriding.", task_name)
 
         self._tasks[task_name] = task_cls
         return task_cls
@@ -266,10 +274,21 @@ class ExperimentRuntime:
     state: RuntimeState = field(default=RuntimeState.INIT)
     """@brief 当前运行时状态。Current runtime state."""
 
-    # 内部缓存字段 Internal caches
+    # ---------- 内部缓存：预处理级 DataLoader ----------
+
+    _train_pre_loader: Optional[DataLoader] = field(
+        default=None, init=False, repr=False
+    )
+    _val_pre_loader: Optional[DataLoader] = field(default=None, init=False, repr=False)
+    _test_pre_loader: Optional[DataLoader] = field(default=None, init=False, repr=False)
+
+    # ---------- 内部缓存：BatchEncoding 级 DataLoader ----------
+
     _train_loader: Optional[DataLoader] = field(default=None, init=False, repr=False)
     _val_loader: Optional[DataLoader] = field(default=None, init=False, repr=False)
     _test_loader: Optional[DataLoader] = field(default=None, init=False, repr=False)
+
+    # ---------- 内部缓存：词表 / batcher / 模型 / 优化器 / 调度器 ----------
 
     _text_vocab: Any = field(default=None, init=False, repr=False)
     _entity_vocab: Any = field(default=None, init=False, repr=False)
@@ -279,6 +298,10 @@ class ExperimentRuntime:
     _model: Optional[nn.Module] = field(default=None, init=False, repr=False)
     _optimizer: Optional[Optimizer] = field(default=None, init=False, repr=False)
     _scheduler: Optional[_LRScheduler] = field(default=None, init=False, repr=False)
+
+    # ----------------------
+    # 状态管理 State management
+    # ----------------------
 
     def transition_to(self, new_state: RuntimeState) -> None:
         """
@@ -294,62 +317,62 @@ class ExperimentRuntime:
         """
         if self.state == RuntimeState.FAILED and new_state == RuntimeState.RUNNING:
             raise RuntimeError("Cannot transition from FAILED to RUNNING directly.")
-        self.logger.info(f"State: {self.state.value} -> {new_state.value}")
+        self.logger.info("State: %s -> %s", self.state.value, new_state.value)
         self.state = new_state
 
     # ----------------------
-    # 数据加载相关 DataLoaders
+    # 预处理级 DataLoader
     # ----------------------
 
-    def get_dataloaders(
+    def get_preprocessed_dataloaders(
         self,
-    ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
+    ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
         """
-        @brief 懒加载并返回 (train, val, test) 三个 DataLoader。
-               Lazily build and return (train, val, test) DataLoaders.
+        @brief 懒加载并返回 (train, val, test) 三个预处理级 DataLoader。
+               Lazily build and return (train, val, test) DataLoaders at
+               PreprocessedSample level.
 
-        @return 一个三元组 (train_loader, val_loader, test_loader)，可能包含 None。
-                A triple (train_loader, val_loader, test_loader); elements may be None.
-
-        @note  具体如何从 ExperimentConfig 构建 DataLoader 由
-               build_all_dataloaders 来完成。
-               The details of building DataLoaders from ExperimentConfig are
-               delegated to build_all_dataloaders.
+        @return (train_pre, val_pre, test_pre) 三元组，元素可能为 None。
+                Triple (train_pre, val_pre, test_pre); elements may be None.
         """
         if (
-            self._train_loader is None
-            and self._val_loader is None
-            and self._test_loader is None
+            self._train_pre_loader is None
+            and self._val_pre_loader is None
+            and self._test_pre_loader is None
         ):
-            self.logger.info("Building all dataloaders...")
+            self.logger.info("Building preprocessed dataloaders...")
             train, val, test = build_all_dataloaders(self.config)
-            self._train_loader, self._val_loader, self._test_loader = train, val, test
-            self.logger.info("Dataloaders built.")
-        return self._train_loader, self._val_loader, self._test_loader
+            self._train_pre_loader, self._val_pre_loader, self._test_pre_loader = (
+                train,
+                val,
+                test,
+            )
+            self.logger.info("Preprocessed dataloaders built.")
+        return self._train_pre_loader, self._val_pre_loader, self._test_pre_loader
 
     @property
-    def train_loader(self) -> Optional[DataLoader]:
-        """@brief 训练 DataLoader 属性访问。Training DataLoader property."""
-        train, _, _ = self.get_dataloaders()
+    def train_preprocessed_loader(self) -> Optional[DataLoader]:
+        """@brief 预处理级训练 DataLoader。Train DataLoader at preprocessed level."""
+        train, _, _ = self.get_preprocessed_dataloaders()
         return train
 
     @property
-    def val_loader(self) -> Optional[DataLoader]:
-        """@brief 验证 DataLoader 属性访问。Validation DataLoader property."""
-        _, val, _ = self.get_dataloaders()
+    def val_preprocessed_loader(self) -> Optional[DataLoader]:
+        """@brief 预处理级验证 DataLoader。Val DataLoader at preprocessed level."""
+        _, val, _ = self.get_preprocessed_dataloaders()
         return val
 
     @property
-    def test_loader(self) -> Optional[DataLoader]:
-        """@brief 测试/预测 DataLoader 属性访问。Test/predict DataLoader property."""
-        _, _, test = self.get_dataloaders()
+    def test_preprocessed_loader(self) -> Optional[DataLoader]:
+        """@brief 预处理级测试 DataLoader。Test DataLoader at preprocessed level."""
+        _, _, test = self.get_preprocessed_dataloaders()
         return test
 
     # ----------------------
     # 词表与批处理 Vocabs & Batcher
     # ----------------------
 
-    def get_vocabs(self, build_if_missing: bool = False) -> tuple[Any, Any]:
+    def get_vocabs(self, build_if_missing: bool = True) -> Tuple[Any, Any]:
         """
         @brief 获取文本与实体词表，必要时可构建并持久化。
                Get text and entity vocabs; optionally build & persist them.
@@ -360,20 +383,16 @@ class ExperimentRuntime:
 
         @return (text_vocab, entity_vocab) 二元组。
                 A pair (text_vocab, entity_vocab).
-
-        @note  具体构建/加载逻辑由 build_or_load_vocabs 实现，建议接受
-               (config, work_dir, train_loader, build_if_missing) 等参数。
-               The actual build/load logic should be implemented in
-               build_or_load_vocabs, which is recommended to accept
-               (config, work_dir, train_loader, build_if_missing).
         """
         if self._text_vocab is None or self._entity_vocab is None:
             self.logger.info("Loading/building vocabs...")
-            train_loader, _, _ = self.get_dataloaders()
+            train_pre, _, _ = self.get_preprocessed_dataloaders()
+            if train_pre is None:
+                raise RuntimeError("Training data is required to build vocabs.")
             self._text_vocab, self._entity_vocab = build_or_load_vocabs(
                 config=self.config,
                 work_dir=self.work_dir,
-                train_loader=train_loader,
+                train_loader=train_pre,
                 build_if_missing=build_if_missing,
             )
             self.logger.info("Vocabs ready.")
@@ -388,11 +407,6 @@ class ExperimentRuntime:
                                 If True and batcher is missing, build it.
 
         @return Batcher 实例。Batcher instance.
-
-        @note  实际构建逻辑由 build_batcher 实现，建议接受
-               (config, text_vocab, entity_vocab)。
-               Actual construction is delegated to build_batcher, which is
-               recommended to accept (config, text_vocab, entity_vocab).
         """
         if self._batcher is None and build_if_missing:
             self.logger.info("Building batcher...")
@@ -406,6 +420,65 @@ class ExperimentRuntime:
         return self._batcher
 
     # ----------------------
+    # BatchEncoding 级 DataLoader
+    # ----------------------
+
+    def get_dataloaders(
+        self,
+    ) -> Tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
+        """
+        @brief 懒加载并返回 (train, val, test) 三个 BatchEncoding 级 DataLoader。
+               Lazily build and return (train, val, test) DataLoaders yielding
+               BatchEncoding objects.
+
+        @return (train_loader, val_loader, test_loader) 三元组，元素可能为 None。
+                Triple (train_loader, val_loader, test_loader); elements may be None.
+        """
+        if (
+            self._train_loader is None
+            and self._val_loader is None
+            and self._test_loader is None
+        ):
+            self.logger.info("Building batched dataloaders...")
+            train_pre, val_pre, test_pre = self.get_preprocessed_dataloaders()
+            text_vocab, entity_vocab = self.get_vocabs(build_if_missing=True)
+
+            if train_pre is not None:
+                self._train_loader = build_batched_dataloaders(
+                    config=self.config,
+                    text_vocab=text_vocab,
+                    entity_vocab=entity_vocab,
+                    train_preprocessed_loader=train_pre,
+                )
+            else:
+                self._train_loader = None
+
+            # 目前 helpers 只实现了 train 的 batching；val/test 暂时留空。
+            self._val_loader = None if val_pre is None else None
+            self._test_loader = None if test_pre is None else None
+
+            self.logger.info("Batched dataloaders built.")
+        return self._train_loader, self._val_loader, self._test_loader
+
+    @property
+    def train_loader(self) -> Optional[DataLoader]:
+        """@brief 训练 DataLoader（BatchEncoding 级）。Train DataLoader with BatchEncoding."""
+        train, _, _ = self.get_dataloaders()
+        return train
+
+    @property
+    def val_loader(self) -> Optional[DataLoader]:
+        """@brief 验证 DataLoader（BatchEncoding 级）。Validation DataLoader with BatchEncoding."""
+        _, val, _ = self.get_dataloaders()
+        return val
+
+    @property
+    def test_loader(self) -> Optional[DataLoader]:
+        """@brief 测试/预测 DataLoader（BatchEncoding 级）。Test/predict DataLoader with BatchEncoding."""
+        _, _, test = self.get_dataloaders()
+        return test
+
+    # ----------------------
     # 模型与优化器 Model & Optimizer
     # ----------------------
 
@@ -413,7 +486,7 @@ class ExperimentRuntime:
         self, checkpoint: Optional[Path | str] = None, rebuild: bool = False
     ) -> nn.Module:
         """
-        @brief 获取 KAN 模型，必要时构建并加载 checkpoint。
+        @brief 获取 KAN 模型，必要时构建并可选加载 checkpoint。
                Get KAN model; optionally build and load checkpoint.
 
         @param checkpoint 可选 checkpoint 路径，用于加载模型参数。
@@ -425,20 +498,28 @@ class ExperimentRuntime:
                 Model instance (already moved to self.device).
         """
         if self._model is None or rebuild:
-            self.logger.info("Building model from config...")
-            self._model = build_model_from_config(self.config).to(self.device)
+            self.logger.info("Building KAN model from config and vocabs...")
+            text_vocab, entity_vocab = self.get_vocabs(build_if_missing=True)
+            self._model = build_kan_with_embeddings(
+                config=self.config,
+                text_vocab=text_vocab,
+                entity_vocab=entity_vocab,
+            ).to(self.device)
             self.logger.info("Model built.")
 
         if checkpoint is not None:
             ckpt_path = Path(checkpoint)
             if ckpt_path.is_file():
-                self.logger.info(f"Loading checkpoint from {ckpt_path}...")
+                self.logger.info("Loading checkpoint from %s", ckpt_path)
                 state = torch.load(ckpt_path, map_location=self.device)
-                # 这里假定 checkpoint 中 key 为 "model"
-                self._model.load_state_dict(state["model"])
+                # 约定 checkpoint 为 {"model": state_dict, ...}
+                model_state = state.get("model", state)
+                self._model.load_state_dict(model_state)
                 self.logger.info("Checkpoint loaded.")
             else:
-                self.logger.warning(f"Checkpoint not found: {ckpt_path}, skip loading.")
+                self.logger.warning(
+                    "Checkpoint not found: %s, skip loading.", ckpt_path
+                )
 
         return self._model
 
@@ -462,8 +543,8 @@ class ExperimentRuntime:
 
     def get_scheduler(self, rebuild: bool = False) -> Optional[_LRScheduler]:
         """
-        @brief 获取学习率调度器，必要时构建。
-               Get learning rate scheduler; build if necessary.
+        @brief 获取学习率调度器，必要时构建（若配置未启用则返回 None）。
+               Get learning rate scheduler; build if necessary (may be None).
 
         @param rebuild 若为 True，则重新构建调度器。
                        If True, rebuild scheduler.
@@ -473,14 +554,14 @@ class ExperimentRuntime:
         """
         if self._scheduler is None or rebuild:
             if self._optimizer is None:
-                # 若未配置调度器，可直接返回 None
-                if not getattr(self.config.training, "use_scheduler", False):
-                    self.logger.info("Scheduler disabled by config.")
-                    return None
+                # 未构建优化器则无法构建调度器
                 raise RuntimeError("Optimizer must be built before building scheduler.")
-            self.logger.info("Building scheduler...")
+            self.logger.info("Building LR scheduler (if enabled)...")
             self._scheduler = build_scheduler(self.config, self._optimizer)
-            self.logger.info("Scheduler built.")
+            if self._scheduler is None:
+                self.logger.info("No LR scheduler configured; returning None.")
+            else:
+                self.logger.info("LR scheduler built.")
         return self._scheduler
 
 
@@ -493,7 +574,7 @@ def create_runtime(
     config: ExperimentConfig,
     work_dir: Path | str,
     override_device: Optional[str] = None,
-    logger: Optional[Any] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> ExperimentRuntime:
     """
     @brief 从 ExperimentConfig 构建 ExperimentRuntime（不执行任何任务）。
@@ -529,7 +610,10 @@ def create_runtime(
     set_global_seed(seed)
 
     logger.info(
-        f"Initialize runtime: work_dir={work_dir}, device={device}, seed={seed}"
+        "Initialize runtime: work_dir=%s, device=%s, seed=%d",
+        work_dir,
+        device,
+        seed,
     )
 
     runtime = ExperimentRuntime(
@@ -569,15 +653,16 @@ def run_task(
            READY/COMPLETED/FAILED -> RUNNING -> COMPLETED/FAILED.
     """
     task_cls = TASK_REGISTRY.get(task_name)
+
     # 检查状态合法性 Check allowed start states
     if runtime.state not in task_cls.allowed_start_states:
+        allowed = [s.value for s in task_cls.allowed_start_states]
         raise RuntimeError(
             f"Task '{task_name}' cannot start from runtime state "
-            f"'{runtime.state.value}'. Allowed: "
-            f"{[s.value for s in task_cls.allowed_start_states]}",
+            f"'{runtime.state.value}'. Allowed: {allowed}",
         )
 
-    runtime.logger.info(f"Starting task '{task_name}' with kwargs={task_kwargs}.")
+    runtime.logger.info("Starting task '%s' with kwargs=%r.", task_name, task_kwargs)
 
     task = task_cls(runtime, **task_kwargs)
 
@@ -590,17 +675,20 @@ def run_task(
         result = task.run()
         task.after_run(result)
         runtime.transition_to(RuntimeState.COMPLETED)
-        runtime.logger.info(f"Task '{task_name}' completed successfully.")
+        runtime.logger.info("Task '%s' completed successfully.", task_name)
         return result
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         runtime.transition_to(RuntimeState.FAILED)
-        runtime.logger.error(f"Task '{task_name}' failed: {exc}", exc_info=True)
-        # 是否重新抛出由你决定，此处选择重抛以便 CLI 可感知错误
+        runtime.logger.error(
+            "Task '%s' failed from state '%s': %s",
+            task_name,
+            prev_state.value,
+            exc,
+            exc_info=True,
+        )
+        # 将异常抛给上层（例如 CLI）以便统一处理
         raise
     finally:
-        # 如果想支持多任务串行，可以在这里决定是否自动回到 READY
-        # If you want to support multiple tasks sequentially, you may choose
-        # to transition back to READY here.
+        # 若任务成功完成，则自动回到 READY，方便串行执行多个任务。
         if runtime.state == RuntimeState.COMPLETED:
-            # 比较保守：成功后切回 READY
             runtime.transition_to(RuntimeState.READY)

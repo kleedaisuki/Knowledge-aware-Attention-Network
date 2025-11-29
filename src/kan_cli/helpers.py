@@ -1,7 +1,11 @@
-from kan import get_logger
+from __future__ import annotations
 
-logger = get_logger(__name__)
-
+"""
+@file helpers.py
+@brief kan_cli 与底层 kan 库之间的“胶水层”工具函数集合。
+       Helper utilities that connect the kan_cli frontend with the core kan
+       library (data → vocabs → batches → model → optimizers).
+"""
 
 from typing import Any, Iterable, Optional, Tuple, Sequence, TypeVar
 
@@ -36,6 +40,19 @@ from kan import (
     ExperimentConfig,
 )
 
+from kan.repr.batching import BatchEncoding  # 仅用于类型注解与文档
+from kan.repr.text_embedding import TextEmbedding, TextEmbeddingConfig
+from kan.repr.entity_embedding import EntityEmbedding, EntityEmbeddingConfig
+
+from kan import get_logger
+
+logger = get_logger(__name__)
+
+
+# ============================================================
+# Phase 1：基础工具：identity_collate / 预处理 Dataset
+# ============================================================
+
 
 def identity_collate(batch: Sequence[_T]) -> Sequence[_T]:
     """
@@ -59,21 +76,21 @@ def identity_collate(batch: Sequence[_T]) -> Sequence[_T]:
 class PreprocessedDataset(Dataset):
     """
     @brief 预处理后样本的数据集封装，兼容 PyTorch DataLoader。
-           Dataset wrapper for preprocessed samples, compatible with PyTorch DataLoader.
+           Dataset wrapper for preprocessed samples, compatible with DataLoader.
     """
 
     def __init__(self, samples: list[PreprocessedSample]) -> None:
         """
-        @brief 保存预处理后的样本列表。
-               Store a list of preprocessed samples.
-        @param samples 预处理后的样本列表。List of preprocessed samples.
+        @brief 使用预处理好的样本列表初始化数据集。
+               Initialize dataset with a list of preprocessed samples.
+        @param samples 预处理样本列表。List of preprocessed samples.
         """
         self._samples = samples
 
     def __len__(self) -> int:
         """
-        @brief 返回样本数量。Return number of samples.
-        @return 数据集中样本数。Number of samples in the dataset.
+        @brief 返回数据集中样本数量。
+               Return the number of samples in the dataset.
         """
         return len(self._samples)
 
@@ -86,6 +103,11 @@ class PreprocessedDataset(Dataset):
         return self._samples[idx]
 
 
+# ============================================================
+# Phase 2：原始 CSV → PreprocessedSample
+# ============================================================
+
+
 def _build_preprocessed_dataset(
     cfg_dataset: DatasetConfig,
     cfg_preprocess: PreprocessConfig,
@@ -93,13 +115,14 @@ def _build_preprocessed_dataset(
 ) -> PreprocessedDataset:
     """
     @brief 从配置构建完整的预处理数据集：CSV → NewsSample → PreprocessedSample。
-           Build a fully preprocessed dataset from configs: CSV → NewsSample → PreprocessedSample.
+           Build a fully preprocessed dataset from configs:
+           CSV → NewsSample → PreprocessedSample.
+
     @param cfg_dataset 数据集配置。Dataset configuration.
     @param cfg_preprocess 预处理配置。Preprocess configuration.
     @param cfg_kg 知识图谱配置。Knowledge graph configuration.
     @return PreprocessedDataset 实例。PreprocessedDataset instance.
     """
-    # 1) 读取原始 CSV 样本
     dataset = NewsDataset(cfg_dataset)
     logger.info(
         "Building preprocessed dataset from %s (num_samples=%d)",
@@ -107,39 +130,35 @@ def _build_preprocessed_dataset(
         len(dataset.samples),
     )
 
-    # 2) 构造 KG 客户端（如启用）
-    kg_client = None
+    kg_client: Optional[KnowledgeGraphClient] = None
     if cfg_preprocess.enable_kg:
         kg_client = KnowledgeGraphClient(cfg_kg)
 
     preprocessor = Preprocessor(cfg_preprocess, kg_client=kg_client)
 
-    # 3) 对全部样本做一次性预处理（简单实现，后续可改为惰性）
-    def _get_samples_from_news_dataset(dataset: NewsDataset) -> Iterable[NewsSample]:
-        for sample in dataset.samples:
-            yield sample
-
+    # 这里直接用 dataset.samples 作为 Iterable[NewsSample]
     preprocessed: list[PreprocessedSample] = preprocessor.preprocess_batch(
-        _get_samples_from_news_dataset(dataset)
+        dataset.samples
     )
+    logger.info("Preprocessed dataset built: %d samples.", len(preprocessed))
 
-    logger.info("Preprocessed dataset built: %d samples", len(preprocessed))
     return PreprocessedDataset(preprocessed)
 
 
 def build_all_dataloaders(
-    config: Any,
-) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
+    config: ExperimentConfig,
+) -> Tuple[DataLoader[Sequence[PreprocessedSample]], Optional[Any], Optional[Any]]:
     """
-    @brief 根据 ExperimentConfig 构建 (train, val, test) 三个 DataLoader。
-           Build (train, val, test) DataLoaders from an ExperimentConfig-like object.
+    @brief 构建 (train, val, test) DataLoader（预处理级别）。
+           Build (train, val, test) DataLoaders at the PreprocessedSample level.
     @param config 实验配置，需至少包含 dataset / preprocess / kg 字段。
            Experiment config, expected to have dataset / preprocess / kg attributes.
     @return (train_loader, val_loader, test_loader) 三元组，当前仅构建 train。
-            Triple (train_loader, val_loader, test_loader); currently only train is built.
-    @note 当前实现假定单一 CSV 作为训练集，不区分验证 / 测试集。
-          This implementation assumes a single CSV as training data, without separate
-          validation/test splits yet.
+            Triple (train_loader, val_loader, test_loader); currently only train.
+    @note 输出的 train_loader 元素类型为 Sequence[PreprocessedSample]，
+          需要配合 Batcher 才能得到 BatchEncoding。
+          The returned train_loader yields Sequence[PreprocessedSample], which
+          must be further processed by Batcher to get BatchEncoding.
     """
     ds_cfg = config.dataset
     pp_cfg = config.preprocess
@@ -147,38 +166,56 @@ def build_all_dataloaders(
 
     preprocessed_dataset = _build_preprocessed_dataset(ds_cfg, pp_cfg, kg_cfg)
 
-    train_loader = DataLoader(
+    train_loader: DataLoader[Sequence[PreprocessedSample]] = DataLoader(
         preprocessed_dataset,
         batch_size=ds_cfg.batch_size,
         shuffle=ds_cfg.shuffle,
         collate_fn=identity_collate,
     )
 
-    # 未来扩展：可以根据 config.dataset_{train,val,test} 构建更多 DataLoader
     val_loader: Optional[DataLoader] = None
     test_loader: Optional[DataLoader] = None
 
     return train_loader, val_loader, test_loader
 
 
+# ============================================================
+# Phase 3：PreprocessedSample 流 → 构建 / 加载 Vocab
+# ============================================================
+
+
 def _iter_preprocessed_samples(
-    train_loader: Iterable[Any],
+    data: Iterable[Any],
 ) -> Iterable[PreprocessedSample]:
     """
-    @brief 辅助函数：从任意可迭代 train_loader 中抽取 PreprocessedSample。
-           Helper to extract PreprocessedSample objects from a generic iterable loader.
-    @param train_loader 训练数据迭代器，元素可以是 PreprocessedSample 或其列表批次。
-           Training data iterable; elements can be PreprocessedSample or batches of them.
+    @brief 辅助函数：从任意可迭代结构中抽取 PreprocessedSample。
+           Helper to extract PreprocessedSample objects from a generic iterable.
+    @param data 可迭代对象，元素可以是 PreprocessedSample、其批次，或 Dataset 本身。
+           Iterable whose elements can be PreprocessedSample, batches thereof,
+           or a Dataset yielding PreprocessedSample.
     @return 逐个产出 PreprocessedSample 的生成器。Generator yielding PreprocessedSample.
     @throws TypeError 如元素类型不符合预期。
             Raises TypeError if element types are unsupported.
     """
-    for item in train_loader:
+    # 1) 如果是 Dataset（实现了 __len__ / __getitem__），我们直接遍历索引
+    if isinstance(data, Dataset):
+        for i in range(len(data)):
+            sample = data[i]
+            if isinstance(sample, PreprocessedSample):
+                yield sample
+            else:
+                raise TypeError(
+                    "Dataset should yield PreprocessedSample, got " f"{type(sample)!r}."
+                )
+        return
+
+    # 2) 否则，就当成一般可迭代对象来处理
+    for item in data:
         if isinstance(item, PreprocessedSample):
-            # 单条样本
+            # 单个样本
             yield item
-        elif isinstance(item, (list, tuple)):
-            # batch 内的每一个元素
+        elif isinstance(item, Sequence):
+            # 一个 batch（例如 DataLoader 的一个输出）
             for sub in item:
                 if isinstance(sub, PreprocessedSample):
                     yield sub
@@ -189,8 +226,8 @@ def _iter_preprocessed_samples(
                     )
         else:
             raise TypeError(
-                "build_or_load_vocabs currently expects train_loader to yield "
-                "PreprocessedSample instances or batches thereof; got "
+                "build_or_load_vocabs expects an iterable of PreprocessedSample "
+                "or batches thereof; got "
                 f"{type(item)!r}. You may need to adjust your pipeline."
             )
 
@@ -208,12 +245,12 @@ def build_or_load_vocabs(
            Experiment config expected to have text_vocab / entity_vocab fields.
     @param work_dir 实验工作目录，用于存放 vocabs/ 子目录。
            Working directory where vocabs/ subdirectory will be created.
-    @param train_loader 训练数据迭代器，通常是 DataLoader，也可直接是预处理数据集。
-           Training data iterable, usually a DataLoader, or a preprocessed dataset.
+    @param train_loader 训练数据迭代器，可以是 DataLoader、Dataset 或任意 Iterable。
+           Training data iterable, may be a DataLoader, Dataset, or generic iterable.
     @param build_if_missing 若为 True，在无现有词表时从训练数据构建新词表。
            If True, build new vocabs from training data when files are missing.
     @return (text_vocab, entity_vocab) 二元组。
-            A pair (text_vocab, entity_vocab).
+            Pair (text_vocab, entity_vocab).
     """
     work_dir = Path(work_dir)
     vocabs_dir = work_dir / "vocabs"
@@ -235,6 +272,11 @@ def build_or_load_vocabs(
             entity_data = json.load(f)
         text_vocab = Vocab.from_dict(text_data)
         entity_vocab = Vocab.from_dict(entity_data)
+        logger.info(
+            "Vocabs loaded: text_vocab_size=%d, entity_vocab_size=%d",
+            len(text_vocab),
+            len(entity_vocab),
+        )
         return text_vocab, entity_vocab
 
     if not build_if_missing:
@@ -243,25 +285,8 @@ def build_or_load_vocabs(
         )
 
     # ---------- 情况 2：从训练数据构建新词表 ----------
-    # 优先从 DataLoader.dataset 取出预处理后的数据集本体，避免 default_collate
-    if hasattr(train_loader, "dataset"):
-        dataset = train_loader.dataset
-        logger.info(
-            "Building new vocabs from dataset attached to train_loader: %s",
-            type(dataset).__name__,
-        )
-    else:
-        # 兜底：如果传进来的本身就是一个 iterable of PreprocessedSample
-        dataset = train_loader
-        logger.info(
-            "Building new vocabs from generic training iterable: %s",
-            type(dataset).__name__,
-        )
-
-    # 这里直接遍历“样本级别”的 dataset，不再触发 DataLoader 的 default_collate
-    samples = list(dataset)
-    if not samples:
-        raise RuntimeError("No training samples found when building vocabularies.")
+    samples = list(_iter_preprocessed_samples(train_loader))
+    logger.info("Building vocabs from %d preprocessed samples.", len(samples))
 
     text_vocab_cfg = getattr(config, "text_vocab", None)
     entity_vocab_cfg = getattr(config, "entity_vocab", None)
@@ -269,7 +294,6 @@ def build_or_load_vocabs(
     text_vocab = build_text_vocab(samples, cfg=text_vocab_cfg)
     entity_vocab = build_entity_vocab(samples, cfg=entity_vocab_cfg)
 
-    # ---------- 持久化到 JSON ----------
     with text_path.open("w", encoding="utf-8") as f:
         json.dump(text_vocab.to_dict(), f, ensure_ascii=False, indent=2)
     with entity_path.open("w", encoding="utf-8") as f:
@@ -281,6 +305,11 @@ def build_or_load_vocabs(
         len(entity_vocab),
     )
     return text_vocab, entity_vocab
+
+
+# ============================================================
+# Phase 3.5：PreprocessedSample → BatchEncoding
+# ============================================================
 
 
 def build_batcher(
@@ -296,83 +325,175 @@ def build_batcher(
     @param text_vocab 文本词表。Text vocabulary.
     @param entity_vocab 实体词表。Entity vocabulary.
     @return Batcher 实例。Batcher instance.
-    @example
-        >>> batcher = build_batcher(exp_cfg, text_vocab, entity_vocab)
-        >>> batch = batcher.collate_fn(list_of_preprocessed_samples)
     """
     batching_cfg = getattr(config, "batching", None)
     if batching_cfg is None:
         batching_cfg = BatchingConfig()
-    elif not isinstance(batching_cfg, BatchingConfig):
-        # 尽量容忍外部传入的“相似对象”，通过字段拷贝构造真正的 BatchingConfig
-        batching_cfg = BatchingConfig(
-            **{
-                field: getattr(batching_cfg, field)
-                for field in BatchingConfig.__annotations__.keys()
-                if hasattr(batching_cfg, field)
-            }
+    if not isinstance(batching_cfg, BatchingConfig):
+        raise TypeError(
+            f"config.batching must be BatchingConfig, got {type(batching_cfg)!r}"
         )
 
-    return Batcher(
+    batcher = Batcher(
         text_vocab=text_vocab,
         entity_vocab=entity_vocab,
         cfg=batching_cfg,
     )
+    logger.info(
+        "Batcher built: max_text_len=%d, max_entities=%d, max_context_len=%d",
+        batching_cfg.max_text_len,
+        batching_cfg.max_entities,
+        batching_cfg.max_text_len,
+    )
+    return batcher
 
 
-def build_model_from_config(config: ExperimentConfig) -> KAN:
+def build_batched_dataloaders(
+    config: ExperimentConfig,
+    text_vocab: Vocab,
+    entity_vocab: Vocab,
+    train_preprocessed_loader: DataLoader[Sequence[PreprocessedSample]],
+) -> DataLoader[BatchEncoding]:
     """
-    @brief 从 ExperimentConfig 构建 KAN 模型。
-           Build a KAN model instance from an ExperimentConfig-like object.
-    @param config 实验配置对象，需至少包含 text_encoder / knowledge_encoder / attention。
-           Experiment config expected to have text_encoder / knowledge_encoder / attention.
-    @return 构造好的 KAN 模型实例。Constructed KAN model instance.
-    @note 本函数只负责 KAN 主干结构，不包含 ID → embedding 的部分；
-          推荐在上层组合 TextEmbedding / EntityEmbedding 与 KAN。
-          This function builds only the core KAN network, without ID→embedding;
-          higher-level code should compose TextEmbedding / EntityEmbedding with KAN.
+    @brief 基于预处理 DataLoader 和词表，构建输出 BatchEncoding 的 DataLoader。
+           Build a DataLoader yielding BatchEncoding from preprocessed samples.
+    @param config ExperimentConfig 实验配置。Experiment configuration.
+    @param text_vocab 文本词表。Text vocabulary.
+    @param entity_vocab 实体词表。Entity vocabulary.
+    @param train_preprocessed_loader 预处理级别的 DataLoader。
+           DataLoader at PreprocessedSample level.
+    @return 一个 DataLoader，其每个元素为 BatchEncoding。
+            A DataLoader whose elements are BatchEncoding.
     """
-    TextEncoderConfig = kan.models.kan.TextEncoderConfig
-    TransformerEncoderConfig = kan.models.transformer_encoder.TransformerEncoderConfig
-    KnowledgeEncoderConfig = kan.models.knowledge_encoder.KnowledgeEncoderConfig
+    ds_cfg = config.dataset
+    batcher = build_batcher(config, text_vocab, entity_vocab)
 
-    # ---- 1) 处理 text encoder：统一成 TextEncoderConfig ----
+    dataset = getattr(train_preprocessed_loader, "dataset", None)
+    if dataset is None:
+        raise ValueError(
+            "train_preprocessed_loader must have a .dataset attribute "
+            "to rebuild batched DataLoader."
+        )
+
+    batched_loader: DataLoader[BatchEncoding] = DataLoader(
+        dataset,
+        batch_size=ds_cfg.batch_size,
+        shuffle=ds_cfg.shuffle,
+        collate_fn=batcher,
+    )
+    return batched_loader
+
+
+# ============================================================
+# Phase 4：模型构建（新 KAN + 显式嵌入）
+# ============================================================
+
+
+def build_kan_with_embeddings(
+    config: ExperimentConfig,
+    text_vocab: Vocab,
+    entity_vocab: Vocab,
+) -> KAN:
+    """
+    @brief 从 ExperimentConfig 与词表构建带嵌入的一站式 KAN 模型。
+           Build a KAN model with integrated embeddings from ExperimentConfig
+           and vocabularies.
+    """
+    # -------- 1) 先构造 KANConfig --------
+    TextEncCfg = kan.models.kan.TextEncoderConfig
+    TransformerEncCfg = kan.models.transformer_encoder.TransformerEncoderConfig
+    KnowledgeEncCfg = kan.models.knowledge_encoder.KnowledgeEncoderConfig
 
     raw_text_cfg = config.text_encoder
-
-    if isinstance(raw_text_cfg, TextEncoderConfig):
+    if isinstance(raw_text_cfg, TextEncCfg):
         text_cfg = raw_text_cfg
-    elif isinstance(raw_text_cfg, TransformerEncoderConfig):
-        text_cfg = TextEncoderConfig(encoder=raw_text_cfg)
+    elif isinstance(raw_text_cfg, TransformerEncCfg):
+        text_cfg = TextEncCfg(encoder=raw_text_cfg)
     else:
         raise TypeError(
-            f"ExperimentConfig.text_encoder 类型非法: {type(raw_text_cfg)}，"
+            f"ExperimentConfig.text_encoder 类型非法: {type(raw_text_cfg)!r}，"
             "期望 TransformerEncoderConfig 或 TextEncoderConfig。"
         )
 
-    # ---- 2) 处理 knowledge encoder：统一成 KnowledgeEncoderConfig ----
     raw_kg_cfg = config.knowledge_encoder
-
-    if isinstance(raw_kg_cfg, KnowledgeEncoderConfig):
+    if isinstance(raw_kg_cfg, KnowledgeEncCfg):
         kg_cfg = raw_kg_cfg
-    elif isinstance(raw_kg_cfg, TransformerEncoderConfig):
-        # 如果你将来允许直接用一个 TransformerEncoderConfig 作为知识编码器，也可以这样包装
-        kg_cfg = KnowledgeEncoderConfig(encoder=raw_kg_cfg)
+    elif isinstance(raw_kg_cfg, TransformerEncCfg):
+        kg_cfg = KnowledgeEncCfg(encoder=raw_kg_cfg)
     else:
         raise TypeError(
-            f"ExperimentConfig.knowledge_encoder 类型非法: {type(raw_kg_cfg)}，"
+            f"ExperimentConfig.knowledge_encoder 类型非法: {type(raw_kg_cfg)!r}，"
             "期望 KnowledgeEncoderConfig 或 TransformerEncoderConfig。"
         )
 
-    # ---- 3) 组装 KANConfig ----
     kan_cfg = KANConfig(
         text=text_cfg,
         knowledge=kg_cfg,
         attention=config.attention,
-        # num_classes / final_dropout 使用 KANConfig 自身默认值，
-        # 如需覆盖，可在 ExperimentConfig 中扩展相应字段后在此读取。
+        num_classes=getattr(getattr(config, "model", None), "num_classes", 2),
+        final_dropout=getattr(getattr(config, "model", None), "final_dropout", 0.1),
+        use_entity_contexts=getattr(
+            getattr(config, "model", None), "use_entity_contexts", True
+        ),
     )
-    return KAN(kan_cfg)
+
+    # -------- 2) 文本嵌入 TextEmbeddingConfig --------
+    te_cfg = getattr(config, "text_embedding", None)
+    if te_cfg is None:
+        te_cfg = TextEmbeddingConfig(
+            vocab_size=len(text_vocab),
+            d_model=kan_cfg.text.encoder.d_model,
+            max_len=config.preprocess.max_tokens,
+            dropout=0.1,
+        )
+    else:
+        if getattr(te_cfg, "vocab_size", 0) <= 0:
+            te_cfg.vocab_size = len(text_vocab)  # type: ignore[attr-defined]
+        if getattr(te_cfg, "d_model", 0) <= 0:
+            te_cfg.d_model = kan_cfg.text.encoder.d_model  # type: ignore[attr-defined]
+        if getattr(te_cfg, "max_len", 0) <= 0:
+            te_cfg.max_len = config.preprocess.max_tokens  # type: ignore[attr-defined]
+
+    # -------- 3) 实体嵌入 EntityEmbeddingConfig（这里是关键修复点） --------
+    ee_cfg = getattr(config, "entity_embedding", None)
+    if ee_cfg is None:
+        ee_cfg = EntityEmbeddingConfig(
+            vocab_size=len(entity_vocab),
+            d_model=kan_cfg.attention.d_model,
+            dropout=0.1,
+            share_entity_context_embeddings=True,
+            context_pooling="mean",
+        )
+    else:
+        if getattr(ee_cfg, "vocab_size", 0) <= 0:
+            ee_cfg.vocab_size = len(entity_vocab)  # type: ignore[attr-defined]
+        if getattr(ee_cfg, "d_model", 0) <= 0:
+            ee_cfg.d_model = kan_cfg.attention.d_model  # type: ignore[attr-defined]
+
+    # -------- 4) 从 vocab 构造嵌入层 --------
+    text_embedding = TextEmbedding.from_vocab(
+        text_vocab, te_cfg.d_model, te_cfg.max_len, te_cfg.dropout
+    )
+    entity_embedding = EntityEmbedding.from_vocab(
+        entity_vocab,
+        ee_cfg.d_model,
+        ee_cfg.dropout,
+        ee_cfg.share_entity_context_embeddings,
+        ee_cfg.context_pooling,
+    )
+
+    model = KAN(
+        config=kan_cfg,
+        text_embedding=text_embedding,
+        entity_embedding=entity_embedding,
+    )
+    logger.info("KAN built from ExperimentConfig and vocabs.")
+    return model
+
+
+# ============================================================
+# Phase 5：优化器 / 学习率调度器（可选）
+# ============================================================
 
 
 def build_optimizer(config: Any, model: nn.Module) -> Optimizer:
@@ -423,19 +544,18 @@ def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]
     """
     training_cfg = getattr(config, "training", None)
     if training_cfg is None:
-        logger.info("No training config; scheduler disabled.")
+        logger.info("No config.training provided; not using LR scheduler.")
         return None
 
-    use_scheduler = getattr(training_cfg, "use_scheduler", False)
     warmup_steps = getattr(training_cfg, "warmup_steps", 0)
-
-    if not use_scheduler or warmup_steps <= 0:
-        logger.info(
-            "Scheduler disabled (use_scheduler=%s, warmup_steps=%d).",
-            use_scheduler,
-            warmup_steps,
-        )
+    if warmup_steps <= 0:
+        logger.info("warmup_steps <= 0; no LR scheduler will be used.")
         return None
+
+    logger.info(
+        "Using linear warmup scheduler: warmup_steps=%d",
+        warmup_steps,
+    )
 
     def lr_lambda(step: int) -> float:
         if step <= 0:
@@ -444,5 +564,4 @@ def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]
             return float(step) / float(max(1, warmup_steps))
         return 1.0
 
-    logger.info("Using linear warmup scheduler: warmup_steps=%d", warmup_steps)
     return LambdaLR(optimizer, lr_lambda=lr_lambda)

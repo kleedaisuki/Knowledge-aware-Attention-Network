@@ -10,11 +10,10 @@ from dataclasses import asdict
 import csv
 import json
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from torch import nn
-from torch import Tensor
+from torch import nn, Tensor
 from torch.nn import functional as F  # noqa: F401  # 预留给未来可能的扩展
 from torch.utils.data import DataLoader
 
@@ -28,8 +27,13 @@ from kan_cli.runtime import (
     register_task,
 )
 
-
 logger = get_logger(__name__)
+
+
+# ============================================================
+# 通用小工具：设备搬运 & Batch 解析
+# Common helpers: device movement & batch parsing
+# ============================================================
 
 
 def _move_to_device(obj: Any, device: torch.device) -> Any:
@@ -54,52 +58,79 @@ def _move_to_device(obj: Any, device: torch.device) -> Any:
 def _from_batch_encoding(
     batch: BatchEncoding,
     device: torch.device,
-) -> Tuple[Dict[str, Any], Optional[torch.Tensor], Optional[List[Any]]]:
+) -> Tuple[BatchEncoding, Optional[torch.Tensor], Optional[List[Any]]]:
     """
-    @brief 从 BatchEncoding 抽取模型输入、标签和 ID，并搬到目标设备。
-           Extract model inputs, labels and IDs from a BatchEncoding and move
-           them onto the target device.
+    @brief 从 BatchEncoding 构造“已搬到设备”的 BatchEncoding，并抽取标签与 ID。
+           Build a device-placed BatchEncoding from the input, and extract labels and IDs.
+    @param batch 原始 BatchEncoding 实例。Original BatchEncoding.
+    @param device 目标设备。Target device.
+    @return (batch_on_device, labels, ids_list) 三元组。
+            A triple (batch_on_device, labels, ids_list).
+    @note
+        * labels 将被转换为 float32 并搬到 device，便于 BCEWithLogitsLoss 使用。
+        * ids_list 始终是 CPU 上的 Python list，便于写 CSV。
     """
-    model_inputs: Dict[str, Any] = {
-        "token_ids": batch.token_ids,
-        "token_padding_mask": batch.token_padding_mask,
-    }
+    # ---- 1) 搬运各字段到设备 Move tensors to device ----
+    token_ids = batch.token_ids.to(device)
+    token_padding_mask = batch.token_padding_mask.to(device)
 
-    if batch.entity_ids is not None:
-        model_inputs["entity_ids"] = batch.entity_ids
-    if batch.entity_padding_mask is not None:
-        model_inputs["entity_padding_mask"] = batch.entity_padding_mask
-    if batch.context_ids is not None:
-        model_inputs["context_ids"] = batch.context_ids
-    if batch.context_padding_mask is not None:
-        model_inputs["context_padding_mask"] = batch.context_padding_mask
+    entity_ids = batch.entity_ids.to(device) if batch.entity_ids is not None else None
+    entity_padding_mask = (
+        batch.entity_padding_mask.to(device)
+        if batch.entity_padding_mask is not None
+        else None
+    )
+    context_ids = (
+        batch.context_ids.to(device) if batch.context_ids is not None else None
+    )
+    context_padding_mask = (
+        batch.context_padding_mask.to(device)
+        if batch.context_padding_mask is not None
+        else None
+    )
 
-    labels: Optional[torch.Tensor] = batch.labels
+    labels: Optional[torch.Tensor] = batch.labels  # type: ignore[assignment]
     if labels is not None:
         if not isinstance(labels, torch.Tensor):
-            labels = torch.as_tensor(labels, dtype=torch.float32)
+            labels = torch.as_tensor(labels, dtype=torch.float32, device=device)
         else:
-            labels = labels.to(dtype=torch.float32)
+            labels = labels.to(device=device, dtype=torch.float32)
 
+    ids_tensor = getattr(batch, "ids", None)
     ids_list: Optional[List[Any]] = None
-    if batch.ids is not None:
-        ids_list = batch.ids.detach().cpu().tolist()
+    ids_on_device: Optional[torch.Tensor] = None
 
-    model_inputs = _move_to_device(model_inputs, device)
-    if labels is not None:
-        labels = labels.to(device=device)
+    if ids_tensor is not None:
+        if isinstance(ids_tensor, torch.Tensor):
+            ids_on_device = ids_tensor.to(device)
+            ids_list = ids_tensor.detach().cpu().tolist()
+        else:
+            # 若 ids 不是 Tensor，则仅保留 Python list 形式
+            ids_list = list(ids_tensor)
+            ids_on_device = None
 
-    return model_inputs, labels, ids_list
+    batch_on_device = BatchEncoding(
+        token_ids=token_ids,
+        token_padding_mask=token_padding_mask,
+        entity_ids=entity_ids,
+        entity_padding_mask=entity_padding_mask,
+        context_ids=context_ids,
+        context_padding_mask=context_padding_mask,
+        labels=labels,
+        ids=ids_on_device,
+    )
+
+    return batch_on_device, labels, ids_list
 
 
 def _extract_batch_io(
     batcher: Any,
     raw_batch: Any,
     device: torch.device,
-) -> Tuple[Dict[str, Any], Optional[Tensor], Optional[List[Any]]]:
+) -> Tuple[Any, Optional[Tensor], Optional[List[Any]]]:
     """
-    @brief 从原始 batch 中抽取模型输入、标签和样本 ID。
-           Extract model inputs, labels and sample IDs from a raw batch.
+    @brief 从原始 batch 中抽取“模型输入对象”、标签和样本 ID。
+           Extract model input object, labels and sample IDs from a raw batch.
     @param batcher Batcher 实例，目前主要用于与 DataLoader 集成以及从
                    PreprocessedSample 序列构造 BatchEncoding。
            Batcher instance, mainly used as DataLoader collate_fn and to build
@@ -116,14 +147,14 @@ def _extract_batch_io(
         解析优先级（从高到低）如下：
         The interpretation priority is:
 
-        1) 若 raw_batch 是 BatchEncoding，直接展开为模型输入/标签/ID。
-           If raw_batch is a BatchEncoding, unpack it directly.
+        1) 若 raw_batch 是 BatchEncoding，直接构造 device 版 BatchEncoding。
+           If raw_batch is a BatchEncoding, move it to device directly.
         2) 若 raw_batch 是 List[PreprocessedSample]，通过 batcher(raw_batch)
-           构造 BatchEncoding 再展开。
+           构造 BatchEncoding 再搬到 device。
            If raw_batch is a List[PreprocessedSample], call batcher(raw_batch)
-           to build a BatchEncoding and then unpack.
-        3) 其他情况：保留一个轻量回退逻辑（dict + batcher.to_model_inputs）
-           以兼容未来扩展或旧代码。
+           to build a BatchEncoding and then move it to device.
+        3) 其他情况：保留一个轻量回退逻辑（dict + batcher.to_model_inputs）以
+           兼容未来扩展或旧代码。
            Otherwise: use a light fallback (dict + batcher.to_model_inputs) for
            extensibility / legacy code.
     """
@@ -147,7 +178,7 @@ def _extract_batch_io(
             batch_encoding = batcher(raw_batch)
             if not isinstance(batch_encoding, BatchEncoding):
                 raise TypeError(
-                    f"Batcher(collate) is expected to return BatchEncoding, "
+                    "Batcher(collate) is expected to return BatchEncoding, "
                     f"got {type(batch_encoding)!r}"
                 )
             return _from_batch_encoding(batch_encoding, device)
@@ -198,6 +229,59 @@ def _extract_batch_io(
     return model_inputs, labels, ids
 
 
+def _ensure_logits_tensor(
+    outputs: Any,
+    logger_obj: Any,
+) -> Tensor:
+    """
+    @brief 从模型输出中抽取 logits 张量，兼容多种返回形式。
+           Extract logits Tensor from model outputs, supporting multiple formats.
+    @param outputs 模型原始输出，可以是 Tensor / tuple / dict。
+           Raw outputs from the model: Tensor / tuple / dict.
+    @param logger_obj 日志记录器，用于输出调试信息。
+           Logger instance used for debugging information.
+    @return logits 张量。Logits tensor.
+    @throws RuntimeError 若无法从输出中解析出 logits。
+            Raises RuntimeError if logits cannot be extracted.
+    @note
+        支持的形式包括：
+        Supported formats include:
+
+        1) Tensor 直接作为 logits。
+           Tensor used directly as logits.
+        2) (logits, aux) 元组，取第 0 个元素。
+           (logits, aux) tuple, take element 0 as logits.
+        3) {"logits": Tensor, ...} 映射，从 "logits" 键中提取。
+           Mapping with "logits" key containing a Tensor.
+    """
+    if isinstance(outputs, Tensor):
+        return outputs
+
+    if isinstance(outputs, tuple):
+        if not outputs:
+            raise RuntimeError("Model returned empty tuple, cannot get logits.")
+        logits = outputs[0]
+        if not isinstance(logits, Tensor):
+            raise RuntimeError(
+                "First element of model output tuple is not a Tensor; "
+                f"got type {type(logits)!r}."
+            )
+        return logits
+
+    if isinstance(outputs, dict):
+        if "logits" in outputs and isinstance(outputs["logits"], Tensor):
+            return outputs["logits"]
+        raise RuntimeError(
+            "Model output dict must contain a Tensor under key 'logits', "
+            f"got keys: {list(outputs.keys())!r}."
+        )
+
+    raise RuntimeError(
+        f"Unsupported model output type: {type(outputs)!r}; "
+        "expected Tensor, tuple, or dict with a 'logits' Tensor."
+    )
+
+
 def _adapt_logits_shape(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -233,6 +317,37 @@ def _adapt_logits_shape(
     )
 
 
+def _prepare_binary_logits_for_predict(
+    logits: torch.Tensor,
+    logger_obj: Any,
+) -> torch.Tensor:
+    """
+    @brief 为预测任务准备一维二分类 logits。
+           Prepare 1D binary logits for prediction.
+    @param logits 模型输出的原始 logits。Raw logits from model.
+    @param logger_obj 日志记录器实例。Logger instance.
+    @return 形状为 (B,) 的一维 logits。1D logits of shape (B,).
+    """
+    if logits.ndim == 1:
+        return logits
+
+    if logits.ndim == 2:
+        if logits.size(1) == 1:
+            return logits.squeeze(1)
+        if logits.size(1) == 2:
+            logger_obj.info(
+                "[tasks] Predict: adapting (B,2) logits -> positive-class via [:,1]."
+            )
+            return logits[:, 1]
+
+    # 兜底：直接展平 Fallback: flatten
+    logger_obj.warning(
+        "[tasks] Predict: unexpected logits shape %s, flattening.",
+        tuple(logits.shape),
+    )
+    return logits.view(-1)
+
+
 def _ensure_eval_loader(runtime: ExperimentRuntime) -> DataLoader:
     """
     @brief 从 runtime 中选择用于评估/预测的 DataLoader。
@@ -253,6 +368,131 @@ def _ensure_eval_loader(runtime: ExperimentRuntime) -> DataLoader:
         )
         return runtime.train_loader  # type: ignore[return-value]
     raise RuntimeError("No DataLoader available for evaluation/prediction.")
+
+
+# ============================================================
+# 公共执行器：二分类推理工具
+# Shared executor: binary classification inference helper
+# ============================================================
+
+
+class _BinaryClassificationRunner:
+    """
+    @brief KAN 二分类推理小助手，封装 eval / predict 通用逻辑。
+           Small helper for KAN binary classification, encapsulating common
+           logic for eval / predict.
+    """
+
+    def __init__(
+        self,
+        runtime: ExperimentRuntime,
+        checkpoint: Optional[Path | str] = None,
+    ) -> None:
+        """
+        @brief 根据 runtime 和 checkpoint 构建推理环境。
+               Build inference environment from runtime and checkpoint.
+        @param runtime 实验运行时。Experiment runtime.
+        @param checkpoint 可选 checkpoint 路径，用于加载权重。
+               Optional checkpoint path to load weights from.
+        """
+        self.runtime = runtime
+        self.device = runtime.device
+        self.batcher = runtime.get_batcher(build_if_missing=True)
+        # 让 runtime 负责构建 + 加载权重
+        self.model = runtime.get_model(checkpoint=checkpoint)
+        self.model.eval()
+
+    def run_evaluation(
+        self,
+        loader: DataLoader,
+    ) -> Tuple[List[float], List[float], List[Any]]:
+        """
+        @brief 在有标签数据集上跑一轮评估推理。
+               Run one pass over a labeled dataset for evaluation.
+        @param loader DataLoader，元素为 BatchEncoding 或预处理样本批次。
+               DataLoader yielding BatchEncoding or preprocessed batches.
+        @return (labels, probs, ids) 三元组。
+                A triple (labels, probs, ids).
+        """
+        all_ids: List[Any] = []
+        all_labels: List[float] = []
+        all_probs: List[float] = []
+
+        with torch.no_grad():
+            for raw_batch in loader:
+                model_inputs, labels, ids = _extract_batch_io(
+                    batcher=self.batcher,
+                    raw_batch=raw_batch,
+                    device=self.device,
+                )
+                if labels is None:
+                    raise RuntimeError(
+                        "Evaluation requires labels, but got labels=None."
+                    )
+
+                if isinstance(model_inputs, dict):
+                    outputs = self.model(**model_inputs)  # type: ignore[arg-type]
+                else:
+                    outputs = self.model(model_inputs)  # type: ignore[arg-type]
+
+                logits = _ensure_logits_tensor(outputs, self.runtime.logger)
+                logits = _adapt_logits_shape(logits, labels, self.runtime.logger)
+                probs = torch.sigmoid(logits).detach().cpu()
+
+                all_probs.extend(probs.tolist())
+                all_labels.extend(labels.detach().cpu().tolist())
+
+                if ids is not None:
+                    all_ids.extend(ids)
+                else:
+                    start = len(all_ids)
+                    all_ids.extend(range(start, start + probs.size(0)))
+
+        return all_labels, all_probs, all_ids
+
+    def run_prediction(
+        self,
+        loader: DataLoader,
+    ) -> Tuple[List[float], List[Any]]:
+        """
+        @brief 在无标签数据集上跑一次预测，输出概率与样本 ID。
+               Run prediction on an unlabeled dataset and return probs & ids.
+        @param loader DataLoader，元素为 BatchEncoding 或预处理样本批次。
+               DataLoader yielding BatchEncoding or preprocessed batches.
+        @return (probs, ids) 二元组。
+                A pair (probs, ids).
+        """
+        all_ids: List[Any] = []
+        all_probs: List[float] = []
+
+        with torch.no_grad():
+            for raw_batch in loader:
+                model_inputs, _labels, ids = _extract_batch_io(
+                    batcher=self.batcher,
+                    raw_batch=raw_batch,
+                    device=self.device,
+                )
+
+                if isinstance(model_inputs, dict):
+                    outputs = self.model(**model_inputs)  # type: ignore[arg-type]
+                else:
+                    outputs = self.model(model_inputs)  # type: ignore[arg-type]
+
+                logits = _ensure_logits_tensor(outputs, self.runtime.logger)
+                logits_1d = _prepare_binary_logits_for_predict(
+                    logits, self.runtime.logger
+                )
+                probs = torch.sigmoid(logits_1d).detach().cpu()
+
+                all_probs.extend(probs.tolist())
+
+                if ids is not None:
+                    all_ids.extend(ids)
+                else:
+                    start = len(all_ids)
+                    all_ids.extend(range(start, start + probs.size(0)))
+
+        return all_probs, all_ids
 
 
 # ============================================================
@@ -289,6 +529,7 @@ class TrainTask(ExperimentTask):
         if train_loader is None:
             raise RuntimeError("TrainTask requires a non-empty train_loader.")
 
+        # 懒加载 batcher / 模型 / 优化器 / 调度器
         batcher = runtime.get_batcher(build_if_missing=True)
         model = runtime.get_model()
         optimizer = runtime.get_optimizer()
@@ -320,11 +561,13 @@ class TrainTask(ExperimentTask):
                         "TrainTask expects labels in each batch, but got None."
                     )
 
+                # 支持两种调用方式：dict（旧风格）与 BatchEncoding（新风格）
                 if isinstance(model_inputs, dict):
-                    logits = model(**model_inputs)  # type: ignore[arg-type]
+                    outputs = model(**model_inputs)  # type: ignore[arg-type]
                 else:
-                    logits = model(model_inputs)  # type: ignore[arg-type]
+                    outputs = model(model_inputs)  # type: ignore[arg-type]
 
+                logits = _ensure_logits_tensor(outputs, runtime.logger)
                 logits = _adapt_logits_shape(logits, labels, runtime.logger)
 
                 loss = criterion(logits, labels)
@@ -405,44 +648,9 @@ class EvaluateTask(ExperimentTask):
         probs_path: Optional[str] = params.get("probs_path")
 
         eval_loader = _ensure_eval_loader(runtime)
-        batcher = runtime.get_batcher(build_if_missing=True)
 
-        model = runtime.get_model(checkpoint=checkpoint_path)
-        model.eval()
-
-        all_ids: List[Any] = []
-        all_labels: List[float] = []
-        all_probs: List[float] = []
-
-        with torch.no_grad():
-            for raw_batch in eval_loader:
-                model_inputs, labels, ids = _extract_batch_io(
-                    batcher=batcher,
-                    raw_batch=raw_batch,
-                    device=runtime.device,
-                )
-                if labels is None:
-                    raise RuntimeError(
-                        "EvaluateTask requires ground-truth labels, but labels is None."
-                    )
-
-                if isinstance(model_inputs, dict):
-                    logits = model(**model_inputs)  # type: ignore[arg-type]
-                else:
-                    logits = model(model_inputs)  # type: ignore[arg-type]
-
-                logits = _adapt_logits_shape(logits, labels, runtime.logger)
-                probs = torch.sigmoid(logits).detach().cpu()
-
-                all_probs.extend(probs.tolist())
-                all_labels.extend(labels.detach().cpu().tolist())
-
-                if ids is not None:
-                    all_ids.extend(ids)
-                else:
-                    # 若无显式 ID，则使用递增整数。
-                    start = len(all_ids)
-                    all_ids.extend(range(start, start + probs.size(0)))
+        runner = _BinaryClassificationRunner(runtime, checkpoint=checkpoint_path)
+        all_labels, all_probs, all_ids = runner.run_evaluation(eval_loader)
 
         if not all_labels:
             raise RuntimeError("No samples collected during evaluation.")
@@ -531,37 +739,8 @@ class PredictTask(ExperimentTask):
         output_path = Path(params.get("output_path", "results.csv"))
 
         pred_loader = _ensure_eval_loader(runtime)
-        batcher = runtime.get_batcher(build_if_missing=True)
-
-        model = runtime.get_model(checkpoint=checkpoint_path)
-        model.eval()
-
-        all_ids: List[Any] = []
-        all_probs: List[float] = []
-
-        with torch.no_grad():
-            for raw_batch in pred_loader:
-                model_inputs, _labels, ids = _extract_batch_io(
-                    batcher=batcher,
-                    raw_batch=raw_batch,
-                    device=runtime.device,
-                )
-
-                if isinstance(model_inputs, dict):
-                    logits = model(**model_inputs)  # type: ignore[arg-type]
-                else:
-                    logits = model(model_inputs)  # type: ignore[arg-type]
-
-                logits = logits.view(-1)
-                probs = torch.sigmoid(logits).detach().cpu()
-
-                all_probs.extend(probs.tolist())
-
-                if ids is not None:
-                    all_ids.extend(ids)
-                else:
-                    start = len(all_ids)
-                    all_ids.extend(range(start, start + probs.size(0)))
+        runner = _BinaryClassificationRunner(runtime, checkpoint=checkpoint_path)
+        all_probs, all_ids = runner.run_prediction(pred_loader)
 
         if not output_path.is_absolute():
             output_path = runtime.work_dir / output_path
