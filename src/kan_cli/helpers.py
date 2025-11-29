@@ -36,7 +36,6 @@ from kan import (
     Batcher,
     KANConfig,
     KAN,
-    NewsSample,
     ExperimentConfig,
 )
 
@@ -430,7 +429,7 @@ def build_kan_with_embeddings(
         text=text_cfg,
         knowledge=kg_cfg,
         attention=config.attention,
-        num_classes=getattr(getattr(config, "model", None), "num_classes", 2),
+        num_classes=getattr(getattr(config, "model", None), "num_classes", 1),
         final_dropout=getattr(getattr(config, "model", None), "final_dropout", 0.1),
         use_entity_contexts=getattr(
             getattr(config, "model", None), "use_entity_contexts", True

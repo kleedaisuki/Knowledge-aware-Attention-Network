@@ -93,9 +93,9 @@ class KANConfig:
           By default, d_model is aligned with TransformerEncoderConfig (128).
     """
 
-    num_classes: int = 2
-    """分类类别数，假新闻检测中默认为 2（真 / 假）。
-       Number of classes, 2 for fake-news detection.
+    num_classes: int = 1
+    """分类类别数
+       Number of classes
     """
 
     final_dropout: float = 0.1

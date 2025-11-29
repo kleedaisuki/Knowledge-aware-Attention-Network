@@ -104,7 +104,7 @@ class KnowledgeGraphClient:
         # 查找所有形如 Q123、Q42 的 token
         candidates = set(re.findall(r"\bQ[0-9]+\b", text))
         entities = sorted(candidates)
-        logger.debug(
+        logger.info(
             f"link_entities: found entities {entities} from text snippet: {text[:50]!r}"
         )
         return entities
@@ -225,7 +225,7 @@ class KnowledgeGraphClient:
         self._neighbor_cache[entity_id] = neighbors
         self._save_neighbors_to_disk(entity_id, neighbors)
 
-        logger.debug(f"get_neighbors: {entity_id} -> {len(neighbors)} neighbors")
+        logger.info(f"get_neighbors: {entity_id} -> {len(neighbors)} neighbors")
         return neighbors
 
     # ------------------------------------------------------------
