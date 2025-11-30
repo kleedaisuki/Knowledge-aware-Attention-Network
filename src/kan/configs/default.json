@@ -12,7 +12,8 @@
         "remove_urls": true,
         "remove_user_mentions": true,
         "max_tokens": 512,
-        "enable_kg": true
+        "enable_kg": true,
+        "tokenizer": "ltp"
     },
     "kg": {
         "endpoint_url": "https://query.wikidata.org/sparql",

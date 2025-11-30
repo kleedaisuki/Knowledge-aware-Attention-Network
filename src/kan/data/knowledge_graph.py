@@ -10,8 +10,10 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
+import requests
 from SPARQLWrapper import SPARQLWrapper, JSON  # type: ignore[import-untyped]
 
 from kan.utils.logging import get_logger
@@ -34,10 +36,10 @@ class KnowledgeGraphConfig:
            HTTP User-Agent header for polite access.
     @param timeout 超时时间（秒）。Request timeout in seconds.
     @param max_neighbors 每个实体最多返回多少一跳邻居。Max number of 1-hop neighbors per entity.
-    @param cache_dir 邻居缓存目录（可选），用于减少重复 SPARQL 查询。
-           Optional cache directory for neighbor results to reduce SPARQL calls.
-    @param language 未来如需查询 label，可指定语言；当前逻辑暂未使用。
-           Language code for labels if needed in future (currently unused).
+    @param cache_dir 邻居缓存目录（可选），用于减少重复 SPARQL / 搜索请求。
+           Optional cache directory for neighbor / search cache to reduce remote calls.
+    @param language 查询 label / 搜索时使用的语言代码。
+           Language code used when searching for labels.
     """
 
     endpoint_url: str = "https://query.wikidata.org/sparql"
@@ -67,9 +69,24 @@ class KnowledgeGraphClient:
         self.cfg = cfg
         self._sparql: Optional[SPARQLWrapper] = None
         self._neighbor_cache: Dict[str, List[str]] = {}
+        # 表面形式 → QID 列表的内存缓存
+        self._surface_cache: Dict[str, List[str]] = {}
 
         if self.cfg.cache_dir is not None:
             os.makedirs(self.cfg.cache_dir, exist_ok=True)
+
+            # 预加载磁盘上的搜索缓存（若存在）。
+            search_cache_path = Path(self.cfg.cache_dir) / "surface_to_qid.json"
+            if search_cache_path.is_file():
+                try:
+                    with open(search_cache_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    if isinstance(data, dict):
+                        for k, v in data.items():
+                            if isinstance(k, str) and isinstance(v, list):
+                                self._surface_cache[k] = [str(x) for x in v]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"Failed to load surface cache: {e}")
 
     # ------------------------------------------------------------
     # 内部工具：获取 SPARQLWrapper 实例
@@ -92,22 +109,143 @@ class KnowledgeGraphClient:
     # 实体链接：从文本 → 实体 ID 列表
     # ------------------------------------------------------------
 
+    def _save_surface_cache(self) -> None:
+        """
+        @brief 将 surface form → 实体 ID 映射写入磁盘缓存。
+               Persist surface-form → entity-id cache to disk.
+        """
+        if self.cfg.cache_dir is None:
+            return
+        path = Path(self.cfg.cache_dir) / "surface_to_qid.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(self._surface_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Failed to save surface cache: {e}")
+
+    def _extract_candidate_spans(self, text: str) -> List[str]:
+        """
+        @brief 从原始文本中抽取用于 Wikidata 搜索的候选片段。
+               Extract candidate surface forms from raw text for Wikidata search.
+        @param text 输入文本。Input text.
+        @return 候选片段列表（去重后）。List of candidate surface forms (deduplicated).
+        @note
+            * 英文：尝试匹配连续的大写开头词，如 "Barack Obama"。
+            * 其它语言：退化为基于空格的 token，再过滤掉太短的 token。
+              For non-English languages, we fall back to space-based tokens and
+              drop very short ones.
+        """
+        candidates: set[str] = set()
+
+        # 1) 已内嵌的 QID 仍然直接识别出来（便于调试）。
+        for qid in re.findall(r"\bQ[0-9]+\b", text):
+            candidates.add(qid)
+
+        # 2) 英文专名：连续的首字母大写单词序列。
+        proper_name_pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
+        for m in proper_name_pattern.finditer(text):
+            span = m.group(1).strip()
+            if len(span) >= 3:
+                candidates.add(span)
+
+        # 3) Fallback：基于空格的简单 token 化。
+        for tok in text.split():
+            tok = tok.strip()
+            if len(tok) < 3:
+                continue
+            # 过滤纯标点
+            if all(ch in ",.;:!?\"'()[]{}" for ch in tok):
+                continue
+            candidates.add(tok)
+
+        return list(candidates)
+
+    def _search_wikidata(self, surface: str, limit: int = 1) -> List[str]:
+        """
+        @brief 使用 Wikidata 的搜索 API，将表面形式映射为一个或多个实体 ID。
+               Use Wikidata search API to map a surface form to one or more entity IDs.
+        @param surface 表面字符串。Surface form string.
+        @param limit 返回的最大实体数量。Maximum number of entity IDs to return.
+        @return 匹配到的实体 ID 列表。List of matched entity IDs.
+        """
+        surface = surface.strip()
+        if not surface:
+            return []
+
+        # 先查内存缓存
+        if surface in self._surface_cache:
+            return self._surface_cache[surface][:limit]
+
+        # QID 直接返回
+        if re.fullmatch(r"Q[0-9]+", surface):
+            self._surface_cache.setdefault(surface, [surface])
+            return [surface]
+
+        params = {
+            "action": "wbsearchentities",
+            "search": surface,
+            "language": self.cfg.language,
+            "format": "json",
+            "limit": str(limit),
+        }
+        headers = {"User-Agent": self.cfg.user_agent}
+
+        try:
+            resp = requests.get(
+                "https://www.wikidata.org/w/api.php",
+                params=params,
+                headers=headers,
+                timeout=self.cfg.timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Wikidata search failed for {surface!r}: {e}")
+            self._surface_cache.setdefault(surface, [])
+            return []
+
+        results: List[str] = []
+        for item in data.get("search", []):
+            qid = item.get("id")
+            if isinstance(qid, str) and qid.startswith("Q"):
+                results.append(qid)
+
+        self._surface_cache.setdefault(surface, results)
+        self._save_surface_cache()
+
+        return results[:limit]
+
     def link_entities(self, text: str) -> List[str]:
         """
-        @brief 极简实体链接：从文本中抽取形如 'Q12345' 的 Wikidata 实体 ID。
-               Minimal entity linking: extract Wikidata-like IDs 'Q12345' from text.
+        @brief 利用 Wikidata 搜索 API 进行轻量级实体链接。
+               Perform lightweight entity linking using Wikidata search API.
         @param text 输入文本。Input text.
         @return 实体 ID 列表（如 ["Q76", "Q30"]）。List of entity IDs, e.g. ["Q76", "Q30"].
-        @note 生产环境建议替换为真正的实体链接组件（如 TagMe / BLINK），但接口保持不变。
-              In production, replace this with a real entity linker, keeping the same API.
+        @note
+            这不是一个“工业级”的实体链接器，只是：
+            1) 抽取若干候选片段（proper names / tokens）；
+            2) 对每个候选调用 Wikidata 搜索；
+            3) 合并得到的若干 QID。
+            It is NOT a full-fledged EL system, but:
+            1) extracts several candidate spans;
+            2) queries Wikidata search for each;
+            3) merges the resulting QIDs.
         """
-        # 查找所有形如 Q123、Q42 的 token
-        candidates = set(re.findall(r"\bQ[0-9]+\b", text))
-        entities = sorted(candidates)
+        candidates = self._extract_candidate_spans(text)
+        entities: List[str] = []
+
+        for surf in candidates:
+            qids = self._search_wikidata(surf, limit=1)
+            entities.extend(qids)
+
+        # 去重并排序，保持结果稳定。
+        unique = sorted(set(entities))
         logger.info(
-            f"link_entities: found entities {entities} from text snippet: {text[:50]!r}"
+            "link_entities: found entities %s from text snippet: %r",
+            unique,
+            text[:80],
         )
-        return entities
+        return unique
 
     # ------------------------------------------------------------
     # 邻居缓存：磁盘读写
@@ -122,18 +260,18 @@ class KnowledgeGraphClient:
         """
         if self.cfg.cache_dir is None:
             return None
-        safe_id = entity_id.replace("/", "_")
-        return os.path.join(self.cfg.cache_dir, f"{safe_id}.json")
+        safe_id = re.sub(r"[^A-Za-z0-9]", "_", entity_id)
+        return str(Path(self.cfg.cache_dir) / f"neighbors_{safe_id}.json")
 
     def _load_neighbors_from_disk(self, entity_id: str) -> Optional[List[str]]:
         """
-        @brief 从磁盘缓存读取实体的一跳邻居列表。
+        @brief 从磁盘缓存加载某实体的一跳邻居。
                Load 1-hop neighbors of an entity from disk cache.
         @param entity_id 实体 ID。Entity ID.
-        @return 邻居列表或 None。Neighbor list or None if not cached.
+        @return 邻居实体 ID 列表或 None。Neighbor entity IDs or None.
         """
         path = self._cache_path(entity_id)
-        if path is None or not os.path.exists(path):
+        if path is None or not os.path.isfile(path):
             return None
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -158,7 +296,7 @@ class KnowledgeGraphClient:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(neighbors, f, ensure_ascii=False)
         except Exception as e:  # noqa: BLE001
-            logger.warn(f"Failed to save neighbor cache for {entity_id}: {e}")
+            logger.warning(f"Failed to save neighbor cache for {entity_id}: {e}")
 
     # ------------------------------------------------------------
     # 对单个实体查询一跳邻居 1-hop neighbors for single entity
@@ -187,7 +325,6 @@ class KnowledgeGraphClient:
         sparql = self._get_sparql()
         query = f"""
         PREFIX wd: <http://www.wikidata.org/entity/>
-        PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 
         SELECT DISTINCT ?neighbor WHERE {{
           {{
@@ -197,11 +334,10 @@ class KnowledgeGraphClient:
           {{
             ?neighbor ?p wd:{entity_id} .
           }}
-          FILTER(STRSTARTS(STR(?neighbor), "http://www.wikidata.org/entity/"))
+          FILTER(isIRI(?neighbor))
         }}
-        LIMIT {self.cfg.max_neighbors}
+        LIMIT {int(self.cfg.max_neighbors)}
         """
-
         sparql.setQuery(query)
 
         try:

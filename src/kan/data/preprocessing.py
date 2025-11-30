@@ -12,6 +12,8 @@ from typing import List, Optional, Any, Sequence, Iterable
 
 from kan.utils.logging import get_logger
 from kan.data.datasets import NewsSample
+from kan.data.knowledge_graph import KnowledgeGraphClient
+from ltp import LTP
 
 logger = get_logger(__name__)
 
@@ -30,6 +32,7 @@ class PreprocessConfig:
     @param remove_user_mentions 是否移除用户提及（例如 @username）。Whether to strip user mentions.
     @param max_tokens 最大 token 数，超过则截断（0 表示不限制）。Max number of tokens (0 = no limit).
     @param enable_kg 是否启用知识图谱相关处理。Whether to enable KG-based processing.
+    @param tokenizer 分词器类型，例如 "ltp" 或 "simple"。Type of tokenizer, e.g. "ltp" or "simple".
     """
 
     do_lowercase: bool = True
@@ -37,6 +40,7 @@ class PreprocessConfig:
     remove_user_mentions: bool = True
     max_tokens: int = 256
     enable_kg: bool = True
+    tokenizer: str = "ltp"
 
 
 @dataclass
@@ -68,7 +72,9 @@ class Preprocessor:
            Preprocessor that converts NewsSample into (tokens, entities, entity_contexts).
     """
 
-    def __init__(self, cfg: PreprocessConfig, kg_client: Optional[Any] = None) -> None:
+    def __init__(
+        self, cfg: PreprocessConfig, kg_client: KnowledgeGraphClient = None
+    ) -> None:
         """
         @brief 初始化预处理器。Initialize preprocessor.
         @param cfg PreprocessConfig 配置对象。Preprocess configuration object.
@@ -81,8 +87,26 @@ class Preprocessor:
         self.cfg = cfg
         self.kg_client = kg_client
 
+        # 决定分词器类型（默认使用 LTP，如不可用则回退到 simple）
+        tokenizer = getattr(self.cfg, "tokenizer", "ltp")
+        self._tokenizer_type: str
+        self._ltp: Optional[Any] = None
+
+        if tokenizer == "ltp":
+            self._ltp = LTP()
+            self._tokenizer_type = "ltp"
+            logger.info(
+                "Preprocessor: initialized LTP tokenizer for Chinese word segmentation."
+            )
+        else:
+            self._tokenizer_type = "simple"
+            logger.info(
+                "Preprocessor: using simple regex-based tokenizer (tokenizer=%s).",
+                tokenizer,
+            )
+
         if self.cfg.enable_kg and self.kg_client is None:
-            logger.warn(
+            logger.warning(
                 "Preprocessor: enable_kg=True 但未提供 kg_client，将只做文本预处理。"
                 "Preprocessor: enable_kg=True but no kg_client given, fallback to text-only."
             )
@@ -116,22 +140,66 @@ class Preprocessor:
         logger.debug(f"Clean text from: [{orig[:30]}...] to [{text[:30]}...]")
         return text
 
-    def _simple_tokenize(self, text: str) -> List[str]:
+    def tokenize(self, text: str) -> List[str]:
         """
-        @brief 简单 token 化函数，基于空白和标点拆分。
-               Simple tokenizer based on whitespaces & punctuation.
+        @brief 文本 token 化：优先使用 LTP 中文分词器，其次回退到正则 tokenizer。
+            Text tokenization: prefer LTP-based Chinese word segmentation, fallback to regex tokenizer.
         @param text 清洗后的文本。Cleaned text.
         @return token 列表。List of tokens.
-        @note 这里实现刻意保持简单，后续可替换为更复杂 tokenizer 而不改变接口。
-              This is intentionally simple; can be replaced by a real tokenizer without API changes.
+        @note
+            - 当 cfg.tokenizer="ltp" 且环境中安装了 LTP 时，使用 LTP 完成分词；
+            否则退回到简单的正则分词实现。
+            - 该接口保持不变，上层只感知 token 序列长度与内容的变化。
+            The API is kept stable; only the actual token sequence may change.
         """
-        # 把常见标点替换成空格，再 split
-        text = re.sub(r"[，。！？；、,.!?;:，【】「」“”\"'()（）]", " ", text)
-        tokens = [tok for tok in text.split(" ") if tok]
+        tokens: List[str]
+
+        if self._tokenizer_type == "ltp" and self._ltp is not None:
+            # LTP 的 seg 接口接受句子列表，返回分词结果列表
+            try:
+                seg_result, _ = self._ltp.seg([text])
+                tokens = list(seg_result[0])
+            except Exception as exc:  # pragma: no cover - 防御型降级
+                logger.error(
+                    "LTP segmentation failed with %s, falling back to simple regex tokenizer.",
+                    exc,
+                )
+                tokens = self._regex_tokenize(text)
+        else:
+            tokens = self._regex_tokenize(text)
 
         if self.cfg.max_tokens > 0 and len(tokens) > self.cfg.max_tokens:
             tokens = tokens[: self.cfg.max_tokens]
 
+        return tokens
+
+    def _regex_tokenize(self, text: str) -> List[str]:
+        """
+        @brief 基于正则的简易分词实现，提取英文单词、数字和单个 CJK 字符。
+            Simple regex-based tokenizer extracting English words, numbers and single CJK chars.
+        @param text 清洗后的文本。Cleaned text.
+        @return token 列表。List of tokens.
+        @note 作为 LTP 不可用时的后备方案，也可用于英文数据集。
+            Used as a fallback when LTP is unavailable, and for pure English datasets.
+        """
+        _TOKEN_PATTERN = re.compile(
+            r"""
+            [A-Za-z]+(?:'[A-Za-z]+)?   # 英文单词，允许内部一个撇号，如 don't
+            | \d+(?:\.\d+)?            # 阿拉伯数字，含简单小数
+            | [\u4e00-\u9fff]          # 单个 CJK（中文等）字符
+            """,
+            re.VERBOSE,
+        )
+
+        # 直接从文本中提取合法 token
+        raw_tokens = _TOKEN_PATTERN.findall(text)
+        tokens = [tok for tok in raw_tokens if tok]
+
+        logger.debug(
+            "Regex tokenizer produced %d tokens, first few: %s",
+            len(tokens),
+            tokens[:10],
+        )
         return tokens
 
     # ------------------------------------------------------------
@@ -187,7 +255,7 @@ class Preprocessor:
         @return 预处理后的样本。Preprocessed sample.
         """
         cleaned = self._clean_text(sample.text)
-        tokens = self._simple_tokenize(cleaned)
+        tokens = self.tokenize(cleaned)
         entities, entity_contexts = self._extract_entities_and_contexts(cleaned)
 
         return PreprocessedSample(
