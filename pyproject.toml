@@ -23,6 +23,7 @@ dependencies = [
   "tqdm>=4.66",
   "rich>=13.7",
   "ltp>=4.2",
+  "hf_xet>=1.2",
 ]
 
 [project.scripts]

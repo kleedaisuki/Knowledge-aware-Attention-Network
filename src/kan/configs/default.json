@@ -13,7 +13,12 @@
         "remove_user_mentions": true,
         "max_tokens": 512,
         "enable_kg": true,
-        "tokenizer": "ltp"
+        "tokenizer": "ltp",
+        "ltp_model_kwargs": {
+            "pretrained_model_name_or_path": "LTP/small",
+            "force_download": true,
+            "cache_dir": "data/ltp_cache"
+        }
     },
     "kg": {
         "endpoint_url": "https://query.wikidata.org/sparql",

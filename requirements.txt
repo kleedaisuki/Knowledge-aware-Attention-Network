@@ -7,6 +7,7 @@ pandas>=2.0
 numpy>=1.26
 scikit-learn>=1.4
 ltp>=4.2
+hf_xet>=1.2 # for LTP
 
 # --- Knowledge graph / SPARQL ---
 SPARQLWrapper>=2.0.0

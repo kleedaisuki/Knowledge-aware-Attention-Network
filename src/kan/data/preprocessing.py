@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import List, Optional, Any, Sequence, Iterable
+from typing import List, Optional, Any, Sequence, Iterable, Dict
 
 from kan.utils.logging import get_logger
 from kan.data.datasets import NewsSample
@@ -41,6 +41,7 @@ class PreprocessConfig:
     max_tokens: int = 256
     enable_kg: bool = True
     tokenizer: str = "ltp"
+    ltp_model_kwargs: Optional[Dict] = None
 
 
 @dataclass
@@ -90,14 +91,36 @@ class Preprocessor:
         # 决定分词器类型（默认使用 LTP，如不可用则回退到 simple）
         tokenizer = getattr(self.cfg, "tokenizer", "ltp")
         self._tokenizer_type: str
-        self._ltp: Optional[Any] = None
+        self._ltp: Any = None
 
         if tokenizer == "ltp":
-            self._ltp = LTP()
-            self._tokenizer_type = "ltp"
-            logger.info(
-                "Preprocessor: initialized LTP tokenizer for Chinese word segmentation."
-            )
+            # 允许通过 config.ltp_model_kwargs 追加更多底层模型参数
+            ltp_kwargs = getattr(self.cfg, "ltp_model_kwargs", None)
+
+            try:
+                self._ltp = LTP(**(ltp_kwargs if isinstance(ltp_kwargs, dict) else {}))
+                self._tokenizer_type = "ltp"
+
+                def _try_get(kwargs: dict, key: Any, default: Any = None):
+                    value = kwargs.get(key)
+                    return value if value is not None else default
+
+                logger.info(
+                    "Preprocessor: initialized LTP tokenizer "
+                    "(model=%s, cache_dir=%s, local_files_only=%s).",
+                    _try_get(ltp_kwargs, "pretrained_model_name_or_path", "LTP/small"),
+                    _try_get(ltp_kwargs, "cache_dir", None),
+                    _try_get(ltp_kwargs, "local_files_only", False),
+                )
+            except Exception as exc:  # pragma: no cover - 防御性降级
+                logger.error(
+                    "Preprocessor: failed to initialize LTP with kwargs %s, "
+                    "falling back to simple regex tokenizer. Error: %s",
+                    ltp_kwargs,
+                    exc,
+                )
+                self._ltp = None
+                self._tokenizer_type = "simple"
         else:
             self._tokenizer_type = "simple"
             logger.info(
@@ -140,26 +163,60 @@ class Preprocessor:
         logger.debug(f"Clean text from: [{orig[:30]}...] to [{text[:30]}...]")
         return text
 
-    def tokenize(self, text: str) -> List[str]:
+    def _tokenize(self, text: str) -> List[str]:
         """
         @brief 文本 token 化：优先使用 LTP 中文分词器，其次回退到正则 tokenizer。
-            Text tokenization: prefer LTP-based Chinese word segmentation, fallback to regex tokenizer.
+               Text tokenization: prefer LTP-based Chinese word segmentation, fallback to regex tokenizer.
         @param text 清洗后的文本。Cleaned text.
         @return token 列表。List of tokens.
         @note
             - 当 cfg.tokenizer="ltp" 且环境中安装了 LTP 时，使用 LTP 完成分词；
-            否则退回到简单的正则分词实现。
+              否则退回到简单的正则分词实现。
             - 该接口保持不变，上层只感知 token 序列长度与内容的变化。
-            The API is kept stable; only the actual token sequence may change.
+              The API is kept stable; only the actual token sequence may change.
         """
         tokens: List[str]
 
+        # 只在配置启用且 _ltp 实例可用时才尝试 LTP
         if self._tokenizer_type == "ltp" and self._ltp is not None:
-            # LTP 的 seg 接口接受句子列表，返回分词结果列表
             try:
-                seg_result, _ = self._ltp.seg([text])
-                tokens = list(seg_result[0])
-            except Exception as exc:  # pragma: no cover - 防御型降级
+                ltp = self._ltp
+
+                # --- 情况 1：老版 LTP（有 seg 方法） ---
+                if hasattr(ltp, "seg"):
+                    # 兼容老接口：seg(...) 既可能直接返回 segments，也可能返回 (segments, hidden)
+                    seg_result = ltp.seg([text])
+                    if isinstance(seg_result, tuple):
+                        segments = seg_result[0]
+                    else:
+                        segments = seg_result
+                    # 预期为 List[List[str]]，取第一句
+                    tokens = list(segments[0])
+
+                # --- 情况 2：新版 LTP（Transformers 版，使用 pipeline 接口） ---
+                elif hasattr(ltp, "pipeline"):
+                    # 只做分词（cws = Chinese Word Segmentation）
+                    output = ltp.pipeline([text], tasks=["cws"])
+
+                    # 新版文档里 output.cws 是 List[List[str]]，但也可能是 dict["cws"]
+                    cws = getattr(output, "cws", None)
+                    if cws is None and isinstance(output, dict):
+                        cws = output.get("cws")
+
+                    if cws is None:
+                        raise RuntimeError("LTP pipeline output does not contain 'cws' field")
+
+                    tokens = list(cws[0])
+
+                # --- 情况 3：既没有 seg 也没有 pipeline，当作 LTP 不可用 ---
+                else:
+                    logger.error(
+                        "LTP instance has neither 'seg' nor 'pipeline' method; "
+                        "falling back to simple regex tokenizer."
+                    )
+                    tokens = self._regex_tokenize(text)
+
+            except Exception as exc:  # pragma: no cover - 防御性降级
                 logger.error(
                     "LTP segmentation failed with %s, falling back to simple regex tokenizer.",
                     exc,
@@ -255,7 +312,7 @@ class Preprocessor:
         @return 预处理后的样本。Preprocessed sample.
         """
         cleaned = self._clean_text(sample.text)
-        tokens = self.tokenize(cleaned)
+        tokens = self._tokenize(cleaned)
         entities, entity_contexts = self._extract_entities_and_contexts(cleaned)
 
         return PreprocessedSample(

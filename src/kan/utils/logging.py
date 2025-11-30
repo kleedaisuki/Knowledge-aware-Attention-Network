@@ -11,6 +11,33 @@ import sys
 from typing import Optional
 
 
+def _ensure_utf8_stream(stream):
+    """
+    @brief 确保给定文本流以 UTF-8 编码输出，避免在 Windows GBK 控制台下出现 UnicodeEncodeError。
+           Ensure that the given text stream writes with UTF-8 encoding to avoid UnicodeEncodeError on Windows GBK consoles.
+    @param stream 原始输出流（例如 sys.stdout / sys.stderr）。
+           Original output stream, e.g. sys.stdout / sys.stderr.
+    @return 使用 UTF-8 重新配置后的流；如无法修改则返回原始流。
+            The stream reconfigured to UTF-8; returns the original stream if reconfiguration is not possible.
+    @note
+        - Python 3.7+ 的 TextIO 支持 reconfigure，我们优先使用它来修改编码；
+          On Python 3.7+, TextIO objects support reconfigure, which we prefer to change the encoding.
+        - errors 使用 'backslashreplace'，可以保证日志系统不会因为单个字符编码失败而中断，
+          同时最大限度保留信息（以 \\uXXXX 形式展示）。
+          We use 'backslashreplace' to ensure logging never crashes on encoding errors,
+          while still preserving information as \\uXXXX sequences.
+    """
+    try:
+        reconfig = getattr(stream, "reconfigure", None)
+        if callable(reconfig):
+            reconfig(encoding="utf-8", errors="backslashreplace")
+    except Exception:
+        # 如果出错，就保持原始流，宁可有点乱码也比直接崩好。
+        # On failure, fall back to the original stream: better mojibake than crashes.
+        return stream
+    return stream
+
+
 class _ExactLevelFilter(logging.Filter):
     """
     @brief 只允许指定等级的日志记录通过的过滤器。Filter that only allows records of an exact level.
@@ -68,19 +95,24 @@ def get_logger(name: Optional[str] = None) -> logging.Logger:
     if getattr(logger, "_kan_configured", False):
         return logger
 
+    # 先确保 stdout/stderr 使用 UTF-8，避免 Windows GBK 控制台编码错误
+    # First ensure stdout/stderr use UTF-8 to avoid Windows GBK encoding errors.
+    stdout = _ensure_utf8_stream(sys.stdout)
+    stderr = _ensure_utf8_stream(sys.stderr)
+
     logger.setLevel(logging.INFO)
     logger.propagate = False
 
     formatter = _create_formatter()
 
     # --- INFO -> stdout ---
-    info_handler = logging.StreamHandler(stream=sys.stdout)
+    info_handler = logging.StreamHandler(stream=stdout)
     info_handler.setLevel(logging.INFO)
     info_handler.addFilter(_ExactLevelFilter(logging.INFO))
     info_handler.setFormatter(formatter)
 
     # --- WARNING/ERROR -> stderr ---
-    err_handler = logging.StreamHandler(stream=sys.stderr)
+    err_handler = logging.StreamHandler(stream=stderr)
     err_handler.setLevel(logging.WARNING)  # 包含 WARNING、ERROR、CRITICAL
     err_handler.setFormatter(formatter)
 
