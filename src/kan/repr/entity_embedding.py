@@ -194,7 +194,10 @@ class EntityEmbedding(nn.Module):
         # 避免除零：对 count=0 的位置保持为 0
         counts_clamped = counts.clamp(min=1.0)
         pooled = summed / counts_clamped
-        pooled[counts == 0] = 0.0
+        
+        # 把 (B, L_e, 1) 的 mask 扩展到 (B, L_e, D) 再进行填充
+        zero_mask = (counts == 0).expand(-1, -1, pooled.size(-1))  # (B, L_e, D)
+        pooled = pooled.masked_fill(zero_mask, 0.0)
         return pooled
 
     # --------------------------------------------------------

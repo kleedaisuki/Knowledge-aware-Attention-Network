@@ -1,0 +1,120 @@
+{
+    "dataset": {
+        "csv_path": "data/news/Atest.csv",
+        "batch_size": 32,
+        "shuffle": true,
+        "text_field": "text",
+        "id_field": "id",
+        "label_field": "label"
+    },
+    "preprocess": {
+        "do_lowercase": true,
+        "remove_urls": true,
+        "remove_user_mentions": true,
+        "max_tokens": 512,
+        "enable_kg": true,
+        "tokenizer": "ltp",
+        "ltp_model_kwargs": {
+            "pretrained_model_name_or_path": "LTP/small",
+            "force_download": true,
+            "cache_dir": "data/ltp_cache"
+        }
+    },
+    "kg": {
+        "endpoint_url": "https://query.wikidata.org/sparql",
+        "user_agent": "KAN-KG-Client/0.1 (https://www.nankai.edu.cn; mailto:guojiarui@mail.nankai.edu.cn)",
+        "timeout": 30,
+        "max_neighbors": 32,
+        "cache_dir": "data/kg_cache",
+        "language": "en"
+    },
+    "repr": {
+        "text_vocab": {
+            "min_freq": 1,
+            "max_size": null,
+            "pad_token": "<pad>",
+            "unk_token": "<unk>",
+            "bos_token": null,
+            "eos_token": null
+        },
+        "entity_vocab": {
+            "min_freq": 1,
+            "max_size": null,
+            "pad_token": "<pad>",
+            "unk_token": "<unk>",
+            "bos_token": null,
+            "eos_token": null
+        },
+        "text_embedding": {
+            "vocab_size": 0,
+            "d_model": 100,
+            "padding_idx": 0,
+            "max_len": 512,
+            "dropout": 0.5
+        },
+        "entity_embedding": {
+            "d_model": 100,
+            "padding_idx": 0,
+            "dropout": 0.5,
+            "share_entity_context_embeddings": true,
+            "context_pooling": "mean"
+        },
+        "batching": {
+            "add_bos_eos_text": false,
+            "max_text_len": 512,
+            "max_entities": 64,
+            "max_context_per_entity": 32
+        }
+    },
+    "text_encoder": {
+        "d_model": 100,
+        "nhead": 4,
+        "num_layers": 1,
+        "dim_feedforward": 2048,
+        "dropout": 0.5,
+        "activation": "relu",
+        "layer_norm_eps": 1e-5,
+        "batch_first": true
+    },
+    "knowledge_encoder": {
+        "share_encoder": false,
+        "encoder": {
+            "d_model": 100,
+            "nhead": 4,
+            "num_layers": 1,
+            "dim_feedforward": 2048,
+            "dropout": 0.5,
+            "activation": "relu",
+            "layer_norm_eps": 1e-5,
+            "batch_first": true
+        }
+    },
+    "attention": {
+        "d_model": 100,
+        "nhead": 4,
+        "dropout": 0.5,
+        "bias": true,
+        "batch_first": true
+    },
+    "training": {
+        "num_epochs": 20,
+        "learning_rate": 0.001,
+        "weight_decay": 0.0,
+        "warmup_steps": 0,
+        "gradient_clip": 1.0,
+        "device": "cpu",
+        "seed": 42,
+        "output_dir": "train/models/weibo",
+        "log_dir": "train/logs/weibo",
+        "save_every": 1
+    },
+    "evaluation": {
+        "device": "cpu",
+        "seed": 42,
+        "checkpoint_path": null,
+        "results_csv": "train/results/results.csv",
+        "threshold": 0.5,
+        "has_labels": true,
+        "compute_metrics": true
+    }
+}
