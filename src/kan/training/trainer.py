@@ -150,21 +150,10 @@ class Trainer:
                Set global random seed, preferring the project's seed utility.
         @param seed 随机种子值。Random seed.
         """
-        try:
-            from kan.utils import seed as seed_utils  # type: ignore[import-not-found]
+        from kan.utils import seed as seed_utils
 
-            seed_utils.set_global_seed(seed)  # type: ignore[attr-defined]
-            logger.info("Global seed set via kan.utils.seed: %d", seed)
-        except Exception:  # noqa: BLE001
-            # 退化为简单的 torch / python 随机种子设置
-            # Fallback to basic torch-only seeding.
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-            logger.info(
-                "Global seed set via torch.manual_seed (fallback): %d",
-                seed,
-            )
+        seed_utils.set_global_seed(seed)
+        logger.info("Global seed set via kan.utils.seed: %d", seed)
 
     # --------------------------------------------------------
     # Warmup 学习率调度（仅线性 warmup）

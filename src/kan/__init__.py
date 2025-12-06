@@ -43,6 +43,8 @@ from .models import (  # type: ignore[F401]
     KnowledgeAttentionConfig,
     NewsEntityAttention,
     NewsEntityContextAttention,
+    BertTextEncoderConfig,
+    BertTextEncoder,
     masked_mean_pool,
     cls_pool,
 )
@@ -108,6 +110,8 @@ __all__ = [
     "KnowledgeAttentionConfig",
     "NewsEntityAttention",
     "NewsEntityContextAttention",
+    "BertTextEncoderConfig",
+    "BertTextEncoder",
     "masked_mean_pool",
     "cls_pool",
     # --- 表示层 repr --- #

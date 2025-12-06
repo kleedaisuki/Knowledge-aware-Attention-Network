@@ -50,6 +50,15 @@ from .kan import (
 )
 
 # ============================================================
+# BERT text Encoder
+# ============================================================
+
+from .bert_text_encoder import (
+    BertTextEncoderConfig,
+    BertTextEncoder,
+)
+
+# ============================================================
 # Package-level Public API
 # ============================================================
 
@@ -59,6 +68,8 @@ __all__ = [
     "TransformerEncoder",
     "KnowledgeEncoderConfig",
     "KnowledgeEncoder",
+    "BertTextEncoderConfig",
+    "BertTextEncoder",
     # 注意力相关 Attention-related
     "KnowledgeAttentionConfig",
     "NewsEntityAttention",

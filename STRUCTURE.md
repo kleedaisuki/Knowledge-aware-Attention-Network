@@ -11,9 +11,6 @@ Knowledge-aware-Attention-Network/
 │  ├─ kan/
 │  │  ├─ __init__.py
 │  │  │
-│  │  ├─ configs/
-│  │  │  └─ default.json
-│  │  │
 │  │  ├─ data/             # 数据 & 知识图谱相关
 │  │  │  ├─ __init__.py
 │  │  │  ├─ datasets.py
@@ -30,6 +27,7 @@ Knowledge-aware-Attention-Network/
 │  │  ├─ models/           # KAN 模型本体
 │  │  │  ├─ __init__.py
 │  │  │  ├─ pooling.py
+│  │  │  ├─ bert_text_encoder.py
 │  │  │  ├─ transformer_encoder.py
 │  │  │  ├─ knowledge_encoder.py
 │  │  │  ├─ attention.py
@@ -65,6 +63,9 @@ Knowledge-aware-Attention-Network/
 │   ├── vocabs/             # text/entity vocab
 │   ├── preds/              # predict 输出
 │   └── metadata.json       # runtime 元信息
+│
+├─ configs/
+│   └─ default.json
 │
 ├─ scripts/
 │   └─ install-dev.ps1

@@ -26,7 +26,7 @@
         "timeout": 30,
         "max_neighbors": 32,
         "cache_dir": "data/kg_cache",
-        "language": "en"
+        "language": "zh"
     },
     "repr": {
         "text_vocab": {
@@ -47,58 +47,66 @@
         },
         "text_embedding": {
             "vocab_size": 0,
-            "d_model": 100,
+            "d_model": 768,
             "padding_idx": 0,
             "max_len": 512,
-            "dropout": 0.5
+            "dropout": 0.1
         },
         "entity_embedding": {
-            "d_model": 100,
+            "vocab_size": 0,
+            "d_model": 768,
             "padding_idx": 0,
-            "dropout": 0.5,
+            "dropout": 0.1,
             "share_entity_context_embeddings": true,
             "context_pooling": "mean"
         },
         "batching": {
             "add_bos_eos_text": false,
-            "max_text_len": 512,
+            "max_text_len": 0,
             "max_entities": 64,
-            "max_context_per_entity": 32
+            "max_context_per_entity": 32,
+            "text_encoding": "bert",
+            "bert_model_name_or_path": "bert-base-chinese",
+            "bert_max_length": 512,
+            "bert_truncation": "head"
         }
     },
     "text_encoder": {
-        "d_model": 100,
-        "nhead": 4,
+        "d_model": 768,
+        "nhead": 12,
         "num_layers": 1,
         "dim_feedforward": 2048,
-        "dropout": 0.5,
-        "activation": "relu",
+        "dropout": 0.1,
+        "activation": "gelu",
         "layer_norm_eps": 1e-5,
         "batch_first": true
     },
     "knowledge_encoder": {
         "share_encoder": false,
         "encoder": {
-            "d_model": 100,
-            "nhead": 4,
+            "d_model": 768,
+            "nhead": 12,
             "num_layers": 1,
             "dim_feedforward": 2048,
-            "dropout": 0.5,
-            "activation": "relu",
+            "dropout": 0.1,
+            "activation": "gelu",
+            "batch_first": true,
             "layer_norm_eps": 1e-5,
-            "batch_first": true
+            "max_seq_len": 512,
+            "positional_encoding": "rope",
+            "rope_theta": 10000.0
         }
     },
     "attention": {
-        "d_model": 100,
-        "nhead": 4,
-        "dropout": 0.5,
+        "d_model": 768,
+        "nhead": 12,
+        "dropout": 0.1,
         "bias": true,
         "batch_first": true
     },
     "training": {
-        "num_epochs": 20,
-        "learning_rate": 0.001,
+        "num_epochs": 5,
+        "learning_rate": 2e-5,
         "weight_decay": 0.0,
         "warmup_steps": 0,
         "gradient_clip": 1.0,
@@ -116,5 +124,13 @@
         "threshold": 0.5,
         "has_labels": true,
         "compute_metrics": true
+    },
+    "bert_text_encoder": {
+        "pretrained_model_name_or_path": "bert-base-chinese",
+        "pooling": "mean+mask",
+        "output_dropout": 0.1,
+        "freeze_encoder": false,
+        "max_length": 512,
+        "return_sequence": true
     }
 }

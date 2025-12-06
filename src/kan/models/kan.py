@@ -13,40 +13,39 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import Tensor, nn
 
-from kan.models.transformer_encoder import (
-    TransformerEncoder,
-    TransformerEncoderConfig,
-)
-from kan.models.knowledge_encoder import (
-    KnowledgeEncoder,
-    KnowledgeEncoderConfig,
-)
+from kan.models.transformer_encoder import TransformerEncoderConfig
+from kan.models.knowledge_encoder import KnowledgeEncoder, KnowledgeEncoderConfig
 from kan.models.attention import (
     KnowledgeAttentionConfig,
     NewsEntityAttention,
     NewsEntityContextAttention,
 )
 from kan.models.pooling import masked_mean_pool, cls_pool
-from kan.utils.logging import get_logger
-
-# repr 子系统：词 ID → 向量
+from kan.models.bert_text_encoder import BertTextEncoder, BertTextEncoderConfig
 from kan.repr.text_embedding import TextEmbedding
 from kan.repr.entity_embedding import EntityEmbedding
 from kan.repr.batching import BatchEncoding
+from kan.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
 # =====================================================================
-# 配置：文本编码子模块
+# 配置：文本编码子模块（旧版） / Text encoder config (legacy)
 # =====================================================================
 
 
 @dataclass
 class TextEncoderConfig:
     """
-    @brief 文本编码配置：封装 TransformerEncoder 以及池化策略。
-           Text encoder config: wraps TransformerEncoder and pooling strategy.
+    @brief 文本编码配置（旧版）：封装 TransformerEncoder 以及池化策略。
+           Text encoder config (legacy): wraps TransformerEncoder and pooling strategy.
+    @note
+        - 新版 KAN 默认使用 BertTextEncoderConfig，经由 KANConfig.text_bert 管理；
+          该配置仅为兼容旧代码而保留，实际前向不会再走 TextEmbedding+Transformer 路径。
+        - The new KAN uses BertTextEncoderConfig via KANConfig.text_bert by default;
+          this config is kept only for backward compatibility and is not used in
+          the forward pass anymore.
     """
 
     encoder: TransformerEncoderConfig = field(default_factory=TransformerEncoderConfig)
@@ -59,7 +58,7 @@ class TextEncoderConfig:
 
 
 # =====================================================================
-# 配置：整体 KAN
+# 总体配置：文本 + 知识 + 注意力 + 分类头
 # =====================================================================
 
 
@@ -71,12 +70,26 @@ class KANConfig:
            attention, and classifier head.
     """
 
-    text: TextEncoderConfig = field(default_factory=TextEncoderConfig)
-    """文本编码器配置。Text encoder configuration."""
+    # --- 文本编码：新版 BERT 文本编码器 ---
+    text_bert: BertTextEncoderConfig = field(default_factory=BertTextEncoderConfig)
+    """
+    @brief 文本编码器（BERT）配置。
+           Configuration for BERT-based text encoder.
+    """
 
+    # --- 文本编码：旧版 Transformer 配置（仅为向后兼容） ---
+    text: Optional[TextEncoderConfig] = None
+    """
+    @brief 旧版文本编码配置，可选；若提供，仅用于保持配置文件结构兼容，当前实现不再使用。
+           Optional legacy text encoder config; kept for backward compatibility of
+           config files, but not used by the current implementation.
+    """
+
+    # --- 知识编码：实体 / 上下文 Transformer ---
     knowledge: KnowledgeEncoderConfig = field(default_factory=KnowledgeEncoderConfig)
     """知识编码器配置。Knowledge encoder configuration."""
 
+    # --- 知识注意力 ---
     attention: KnowledgeAttentionConfig = field(
         default_factory=lambda: KnowledgeAttentionConfig(
             d_model=TransformerEncoderConfig().d_model,
@@ -88,51 +101,48 @@ class KANConfig:
     )
     """
     @brief 知识注意力配置（N-E 与 N-E²C 共用）。
-           Config for knowledge attention (shared by N-E and N-E²C).
-    @note 默认 d_model 与 TransformerEncoderConfig 保持一致（128）。
-          By default, d_model is aligned with TransformerEncoderConfig (128).
+           Knowledge attention configuration shared by N-E and N-E²C modules.
+    @note
+        - 实际运行时，d_model 将在 KAN.__init__ 中对齐到底层 BERT 的 hidden_size；
+          这里的默认值仅用于占位。
+        - At runtime, d_model will be aligned to the underlying BERT hidden_size in
+          KAN.__init__; the default here is merely a placeholder.
     """
 
-    num_classes: int = 1
-    """分类类别数
-       Number of classes
-    """
+    num_classes: int = 2
+    """分类类别数。Number of classes for classification."""
 
     final_dropout: float = 0.1
-    """拼接后的表示在分类前的 dropout。
-       Dropout probability before classifier.
-    """
+    """分类头前的 dropout 比例。Dropout probability before classifier head."""
 
     use_entity_contexts: bool = True
-    """是否启用实体上下文路径 N-E²C；若 False，只使用 N-E（实体）分支。
-       Whether to enable entity context path (N-E²C). If False, only N-E (entities) is used.
+    """是否在最终特征中拼接实体上下文路径 r。
+       Whether to include context path r in the final concatenated features.
     """
 
     zero_if_no_entities: bool = True
-    """当没有实体输入时，是否使用全零向量代替实体 / 上下文表示。
-       When no entity inputs are given, whether to use zero vectors for entity/context
-       representations.
+    """
+    @brief 当没有实体输入时，是否使用零向量作为实体/上下文表示。
+           When no entity inputs are given, whether to use zero vectors for entity/context
+           representations.
     """
 
     def validate(self) -> None:
         """
         @brief 做简单配置一致性检查，例如 d_model 对齐。
                Perform basic config consistency checks, e.g., matching d_model.
-        @note 目前仅检查 attention.d_model 与 encoder.d_model 是否一致。
-              Currently only checks attention.d_model equals text.encoder.d_model.
+        @note
+            - 由于文本 now 由 BERT 负责，注意力维度与知识编码器的 d_model 需要保持一致；
+              文本路径维度将在运行时再进行一次检查和日志提醒。
+            - Since text is now encoded by BERT, attention.d_model should match
+              knowledge.encoder.d_model; the text/BERT dimension will be validated
+              at runtime.
         """
-        if self.attention.d_model != self.text.encoder.d_model:
-            raise ValueError(
-                "KANConfig mismatch: attention.d_model "
-                f"{self.attention.d_model} != text.encoder.d_model {self.text.encoder.d_model}. "
-                "Please align them explicitly."
-            )
         if self.attention.d_model != self.knowledge.encoder.d_model:
-            # 这里不强制 raise，而是提示；因为 KnowledgeEncoderConfig 可能被手动修改
-            # We only warn here because KnowledgeEncoderConfig may be overridden manually
             logger.warning(
                 "KANConfig warning: attention.d_model (%d) != knowledge.encoder.d_model (%d). "
-                "Make sure entity/context embeddings have the same dimension as text encoder.",
+                "They will be reconciled in KAN.__init__, but you may want to align them "
+                "explicitly in your config.",
                 self.attention.d_model,
                 self.knowledge.encoder.d_model,
             )
@@ -161,31 +171,68 @@ class KAN(nn.Module):
                Construct KAN model and inject embedding layers and submodules.
         @param config KANConfig 配置对象。
                KANConfig configuration instance.
-        @param text_embedding 文本嵌入层，用于 token ID → 向量。
-               TextEmbedding module mapping token IDs to vectors.
+        @param text_embedding 文本嵌入层，用于 token ID → 向量（当前实现不会在前向中使用）。
+               TextEmbedding module mapping token IDs to vectors (not used in the
+               current forward pass, kept for backward compatibility).
         @param entity_embedding 实体嵌入层，用于实体 / 上下文 ID → 向量。
                EntityEmbedding module mapping entity/context IDs to vectors.
         """
         super().__init__()
         self.config = config
-        self.config.validate()
-
-        # 嵌入层（repr 子系统）
-        self.text_embedding = text_embedding
+        self.text_embedding = (
+            text_embedding  # 保留以兼容构造协议 / kept for API compatibility
+        )
         self.entity_embedding = entity_embedding
 
-        # 文本编码器：S -> S'
-        self.text_encoder = TransformerEncoder(self.config.text.encoder)
+        # -------- 1) 文本编码器：BERT 路径 --------
+        self.text_encoder_bert = BertTextEncoder(self.config.text_bert)
+        text_dim = self.text_encoder_bert.hidden_size
 
-        # 知识编码器：E, EC -> q', r'
+        # -------- 2) 对齐知识编码器维度 d_model --------
+        # 如果配置中的 knowledge.encoder.d_model 与 BERT 维度不符，则在此对齐并提示。
+        if self.config.knowledge.encoder.d_model != text_dim:
+            logger.info(
+                "Adjusting KnowledgeEncoderConfig.d_model from %d to match BERT hidden_size=%d.",
+                self.config.knowledge.encoder.d_model,
+                text_dim,
+            )
+            self.config.knowledge.encoder.d_model = text_dim
+
         self.knowledge_encoder = KnowledgeEncoder(self.config.knowledge)
 
-        # N-E / N-E²C 注意力模块
-        self.news_entity_attn = NewsEntityAttention(self.config.attention)
-        self.news_entity_ctx_attn = NewsEntityContextAttention(self.config.attention)
+        # 尝试检查实体嵌入维度是否与 BERT 一致（若实体嵌入暴露了 cfg.d_model 字段）
+        ent_cfg = getattr(self.entity_embedding, "cfg", None)
+        if ent_cfg is not None and getattr(ent_cfg, "d_model", None) != text_dim:
+            logger.warning(
+                "EntityEmbedding.d_model (%s) != BERT hidden_size (%d). "
+                "This may cause dimension mismatch.",
+                getattr(ent_cfg, "d_model", None),
+                text_dim,
+            )
 
-        # 分类头：z = [p; q; r] → logits
-        d = self.config.attention.d_model
+        # -------- 3) 对齐注意力配置的 d_model，并构造注意力模块 --------
+        att_cfg = self.config.attention
+        if att_cfg.d_model != text_dim:
+            logger.info(
+                "Rebuilding KnowledgeAttentionConfig with d_model=%d (from %d) to "
+                "match BERT hidden_size.",
+                text_dim,
+                att_cfg.d_model,
+            )
+            att_cfg = KnowledgeAttentionConfig(
+                d_model=text_dim,
+                nhead=att_cfg.nhead,
+                dropout=att_cfg.dropout,
+                bias=att_cfg.bias,
+                batch_first=att_cfg.batch_first,
+            )
+        self._attn_config = att_cfg
+
+        self.news_entity_attn = NewsEntityAttention(att_cfg)
+        self.news_entity_ctx_attn = NewsEntityContextAttention(att_cfg)
+
+        # -------- 4) 分类头：z = [p; q; r] → logits --------
+        d = text_dim
         feature_dim = d  # p
         feature_dim += d  # q
         if self.config.use_entity_contexts:
@@ -195,7 +242,7 @@ class KAN(nn.Module):
         self.classifier = nn.Linear(feature_dim, self.config.num_classes)
 
         logger.info(
-            "Initialized KAN (with embeddings): d_model=%d, num_classes=%d, "
+            "Initialized KAN (BERT text encoder): d_model=%d, num_classes=%d, "
             "use_entity_contexts=%s, final_dropout=%.3f",
             d,
             self.config.num_classes,
@@ -204,7 +251,7 @@ class KAN(nn.Module):
         )
 
     # -----------------------------------------------------------------
-    # 内部辅助：文本编码
+    # 内部辅助：文本编码（BERT）
     # -----------------------------------------------------------------
     def _encode_text(
         self,
@@ -212,30 +259,34 @@ class KAN(nn.Module):
         token_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        @brief 编码新闻文本序列并做池化，得到全局新闻表示 p。
-               Encode news token sequence and pool to get global news representation p.
-        @param token_ids 文本 ID 张量，形状为 (B, L_t)。
-               Text token ID tensor of shape (B, L_t).
+        @brief 使用 BERT 编码新闻文本序列并做池化，得到全局新闻表示 p。
+               Encode news token sequence with BERT and pool to get global news
+               representation p.
+        @param token_ids 文本 ID 张量，形状为 (B, L_t)，来自 Batcher 的 token_ids。
+               Text token ID tensor of shape (B, L_t), as produced by Batcher in
+               BERT mode.
         @param token_padding_mask 文本 padding 掩码，形状为 (B, L_t)，True 表示 padding。
-               Padding mask for text, shape (B, L_t), True marks padding positions.
+               Padding mask for text, shape (B, L_t), where True marks padding.
         @return 新闻全局表示 p，形状为 (B, D)。
                 Global news representation p of shape (B, D).
         """
-        # ID → 嵌入： (B, L_t) -> (B, L_t, D)
-        news_embeddings = self.text_embedding(token_ids)
+        # Batcher 中的 token_padding_mask: True = padding；BERT 需要 attention_mask: 1 = valid
+        if token_padding_mask is not None:
+            attention_mask = (~token_padding_mask).to(dtype=torch.long)
+        else:
+            attention_mask = None
 
-        # Transformer 编码：S' -> encoded(S')
-        encoded = self.text_encoder(
-            news_embeddings,
-            src_key_padding_mask=token_padding_mask,
+        # BERT 编码：返回序列表示与池化表示；我们只使用 pooled 向量作为 p
+        sequence_output, pooled = self.text_encoder_bert(
+            input_ids=token_ids,
+            attention_mask=attention_mask,
+            token_type_ids=None,
         )
 
-        # 池化成 (B, D)：CLS 或 masked mean
-        if self.config.text.use_cls_pooling:
-            p = cls_pool(encoded)
-        else:
-            p = masked_mean_pool(encoded, padding_mask=token_padding_mask)
-        return p
+        # sequence_output 目前未被使用，但保留变量名以便未来扩展（如 token-level 融合）
+        _ = sequence_output
+
+        return pooled  # (B, D)
 
     # -----------------------------------------------------------------
     # 内部辅助：知识编码（实体 + 上下文）
@@ -272,7 +323,11 @@ class KAN(nn.Module):
             context_padding_mask=context_padding_mask,
         )
 
-        # 交给 KnowledgeEncoder 处理序列结构
+        # 如果上下文关闭或未提供，则默认上下文与实体相同
+        if not self.config.use_entity_contexts or ctx_emb is None:
+            ctx_emb = entity_emb
+
+        # 统一使用实体 padding_mask 作为 Transformer 的 src_key_padding_mask
         q_prime, r_prime = self.knowledge_encoder(
             entity_embeddings=entity_emb,
             context_embeddings=ctx_emb,
@@ -281,50 +336,53 @@ class KAN(nn.Module):
         return q_prime, r_prime
 
     # -----------------------------------------------------------------
-    # 前向：BatchEncoding → logits (+ attention)
+    # 前向传播：BatchEncoding → logits（+ 可选注意力权重）
     # -----------------------------------------------------------------
     def forward(
         self,
         batch: BatchEncoding,
-        *,
         return_attn_weights: bool = False,
     ) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
         """
-        @brief 前向传播：实现 BatchEncoding → logits 的完整 KAN 流水线。
-               Forward pass: full KAN pipeline mapping BatchEncoding to logits.
-        @param batch BatchEncoding 批次张量封装（ID + mask + 可选标签）。
-               BatchEncoding instance containing IDs, masks and optional labels.
-        @param return_attn_weights 若为 True，返回注意力权重以便可视化 / 解释。
-               If True, also returns attention weights for analysis / visualization.
+        @brief 前向计算：从 BatchEncoding 计算分类 logits。
+               Forward computation: compute classification logits from BatchEncoding.
+        @param batch Batcher.collate 返回的 BatchEncoding。
+               BatchEncoding produced by Batcher.collate.
+        @param return_attn_weights 是否返回注意力权重（字典结构），主要用于可视化与调试。
+               Whether to also return attention weights (as a dict) for visualization
+               and debugging.
         @return (logits, aux)：
-                - logits 形状为 (B, num_classes)；
-                  logits of shape (B, num_classes);
-                - aux 为可选字典，包含 'ne_weights' 与 'ne2c_weights'（如请求）。
-                  aux is an optional dict with 'ne_weights'/'ne2c_weights' if requested.
+                - logits: (B, num_classes) 的分类 logits。
+                - aux:   可选的附加信息（如注意力权重），或 None。
         """
-        # -------- Step 1: 文本编码 p --------
+        # -------- Step 1: 文本编码，得到新闻全局表示 p --------
         p = self._encode_text(
             token_ids=batch.token_ids,
             token_padding_mask=batch.token_padding_mask,
         )
 
-        aux: Dict[str, Tensor] = {}
+        # -------- Step 2: 知识编码，得到实体 / 上下文中间表示 q' / r' --------
+        q_prime, r_prime = self._encode_knowledge(
+            entity_ids=batch.entity_ids,
+            context_ids=batch.context_ids,
+            entity_padding_mask=batch.entity_padding_mask,
+            context_padding_mask=batch.context_padding_mask,
+        )
 
-        # -------- Step 2: 知识编码 + 注意力 q, r --------
-        if batch.entity_ids is not None:
-            # 2.1 ID → 嵌入 → q', r'
-            q_prime, r_prime = self._encode_knowledge(
-                entity_ids=batch.entity_ids,
-                context_ids=batch.context_ids,
-                entity_padding_mask=batch.entity_padding_mask,
-                context_padding_mask=batch.context_padding_mask,
-            )
-
-            # 理论上如果存在 entity_ids，就应该得到 q_prime
-            if q_prime is None:
-                raise RuntimeError(
-                    "KAN: entity_ids is not None, but _encode_knowledge returned None."
+        # 若完全没有实体，按配置决定是否退化为“仅文本”模型
+        if q_prime is None or batch.entity_ids is None:
+            if self.config.zero_if_no_entities:
+                # 使用与 p 同批大小、同维度的零向量作为 q / r
+                B, D = p.shape
+                q = torch.zeros(B, D, device=p.device, dtype=p.dtype)
+                r = torch.zeros(B, D, device=p.device, dtype=p.dtype)
+                attn_info: Dict[str, Tensor] = {}
+            else:
+                raise ValueError(
+                    "KAN forward: entity inputs are None but zero_if_no_entities=False."
                 )
+        else:
+            attn_info: Dict[str, Tensor] = {}
 
             # 2.2 N-E：News → Entities，得到加权实体表示 q
             q, ne_weights = self.news_entity_attn(
@@ -333,6 +391,8 @@ class KAN(nn.Module):
                 entity_padding_mask=batch.entity_padding_mask,
                 need_weights=return_attn_weights,
             )
+            if return_attn_weights and ne_weights is not None:
+                attn_info["news_entity"] = ne_weights
 
             # 2.3 N-E²C：News → (Entities, Contexts)，得到加权上下文表示 r
             if self.config.use_entity_contexts and r_prime is not None:
@@ -343,23 +403,12 @@ class KAN(nn.Module):
                     entity_padding_mask=batch.entity_padding_mask,
                     need_weights=return_attn_weights,
                 )
+                if return_attn_weights and ne2c_weights is not None:
+                    attn_info["news_entity_context"] = ne2c_weights
             else:
-                r, ne2c_weights = None, None
-
-            if return_attn_weights:
-                if ne_weights is not None:
-                    aux["ne_weights"] = ne_weights
-                if ne2c_weights is not None:
-                    aux["ne2c_weights"] = ne2c_weights
-        else:
-            # -------- 无实体时的降级行为 --------
-            d = p.size(-1)
-            if self.config.zero_if_no_entities:
-                q = torch.zeros_like(p)
-                r = torch.zeros_like(p) if self.config.use_entity_contexts else None
-            else:
-                q = p
-                r = p if self.config.use_entity_contexts else None
+                # 若未启用上下文，则简单用零向量占位
+                B, D = p.shape
+                r = torch.zeros(B, D, device=p.device, dtype=p.dtype)
 
         # -------- Step 3: 拼接表示 z = [p; q; r] --------
         features = [p, q]
@@ -372,5 +421,5 @@ class KAN(nn.Module):
         logits = self.classifier(z)
 
         if return_attn_weights:
-            return logits, aux
+            return logits, attn_info
         return logits, None

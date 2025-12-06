@@ -24,6 +24,7 @@ dependencies = [
   "rich>=13.7",
   "ltp>=4.2",
   "hf_xet>=1.2",
+  "jieba>=0.42.1",
 ]
 
 [project.scripts]

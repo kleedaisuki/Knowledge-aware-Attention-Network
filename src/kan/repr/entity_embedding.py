@@ -42,7 +42,7 @@ class EntityEmbeddingConfig:
     """
 
     vocab_size: int
-    d_model: int = 128
+    d_model: int = 768
     padding_idx: int = 0
     dropout: float = 0.1
     share_entity_context_embeddings: bool = True

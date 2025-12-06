@@ -9,15 +9,22 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from kan.utils.logging import get_logger
+
+# 数据 / 预处理 / 知识图谱
 from kan.data.datasets import DatasetConfig
 from kan.data.preprocessing import PreprocessConfig
 from kan.data.knowledge_graph import KnowledgeGraphConfig
+
+# 模型：文本编码 / 知识编码 / 注意力
 from kan.models.transformer_encoder import TransformerEncoderConfig
 from kan.models.knowledge_encoder import KnowledgeEncoderConfig
 from kan.models.attention import KnowledgeAttentionConfig
+from kan.models.bert_text_encoder import BertTextEncoderConfig
+
+# 训练 / 评估
 from kan.training.trainer import TrainingConfig
 from kan.training.evaluator import EvaluationConfig
 
@@ -48,13 +55,19 @@ class ExperimentConfig:
     @param text_embedding 文本嵌入层配置（d_model、max_len 等超参数）。
            Text embedding config (d_model, max_len, dropout, etc.).
     @param entity_embedding 实体/上下文嵌入层配置。Entity / context embedding config.
-    @param batching 批处理配置（最大长度、是否加 BOS/EOS 等）。
-           Batching config (truncation limits, BOS/EOS, etc.).
-    @param text_encoder 文本 Transformer 编码器配置。Text Transformer encoder config.
-    @param knowledge_encoder 知识编码器配置。Knowledge encoder config.
-    @param attention 知识注意力层配置。Knowledge attention config.
+    @param batching 批处理配置（最大长度、BERT/Vocab 模式、是否加 BOS/EOS 等）。
+           Batching config (truncation limits, BOS/EOS, BERT vs vocab mode, etc.).
+    @param text_encoder 文本 Transformer 编码器配置（旧路径 / News Encoder）。
+           Text Transformer encoder config (legacy news encoder).
+    @param knowledge_encoder 知识编码器配置（实体 + 上下文）。
+           Knowledge encoder config (entities + contexts).
+    @param attention 知识注意力层配置（N-E / N-E²C）。
+           Knowledge attention config (N-E / N-E²C).
+
     @param training 训练流程配置。Training pipeline config.
     @param evaluation 评估 / 推理流程配置。Evaluation / inference pipeline config.
+    @param bert_text_encoder 基于预训练 BERT 的文本编码器配置；可选。
+           Optional config for BERT-based text encoder; if None, legacy text path is used.
     """
 
     # 数据 / 预处理 / 知识图谱
@@ -77,6 +90,9 @@ class ExperimentConfig:
     # 训练 & 评估
     training: TrainingConfig
     evaluation: EvaluationConfig
+
+    # BERT 文本编码器（可选）
+    bert_text_encoder: Optional[BertTextEncoderConfig] = None
 
 
 # ============================================================
@@ -136,6 +152,9 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
     #   "entity_embedding": {...},
     #   "batching": {...}
     # }
+    # 其中 batching 同时承担 vocab 模式 & BERT 模式的配置：
+    #   - text_encoding: "vocab" | "bert"
+    #   - bert_model_name_or_path, bert_max_length, bert_truncation 等
     # ========================================================
     repr_raw = data.get("repr", {}) or {}
 
@@ -149,7 +168,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         **_filter_kwargs(VocabConfig, repr_raw.get("entity_vocab", {}))
     )
 
-    # ---------- text encoder (news encoder) ----------
+    # ---------- text encoder (legacy news encoder: Transformer) ----------
     text_encoder_cfg = TransformerEncoderConfig(
         **_filter_kwargs(TransformerEncoderConfig, data.get("text_encoder", {}))
     )
@@ -158,7 +177,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
     ke_raw = data.get("knowledge_encoder", {}) or {}
 
     # 嵌套字段 encoder 需要先专门构造 TransformerEncoderConfig
-    # Nested field "encoder" should be built explicitly
+    # Nested field "encoder" should be built explicitly.
     encoder_raw = ke_raw.get("encoder", {})
     if isinstance(encoder_raw, dict) and encoder_raw:
         encoder_cfg = TransformerEncoderConfig(
@@ -170,6 +189,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         knowledge_encoder_cfg = KnowledgeEncoderConfig(encoder=encoder_cfg, **ke_kwargs)
     else:
         # 没有提供 encoder 子配置，则使用 KnowledgeEncoderConfig 自带默认 encoder
+        # If no nested encoder config is provided, rely on defaults in KnowledgeEncoderConfig.
         knowledge_encoder_cfg = KnowledgeEncoderConfig(
             **_filter_kwargs(KnowledgeEncoderConfig, ke_raw)
         )
@@ -196,15 +216,20 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
     # Text Embedding
     te_raw = repr_raw.get("text_embedding", {}) or {}
     te_kwargs = _filter_kwargs(TextEmbeddingConfig, te_raw)
+
+    # vocab_size: 使用 0 作为占位，真正构造时用 vocab.size 来填充
     if "vocab_size" not in te_kwargs:
         te_kwargs["vocab_size"] = 0  # 占位，实际构建时由 vocab 决定
+    # d_model: 默认对齐文本编码器的 d_model
     if "d_model" not in te_kwargs:
         te_kwargs["d_model"] = text_encoder_cfg.d_model
+
     text_embedding_cfg = TextEmbeddingConfig(**te_kwargs)
 
     # Entity Embedding
     ee_raw = repr_raw.get("entity_embedding", {}) or {}
     ee_kwargs = _filter_kwargs(EntityEmbeddingConfig, ee_raw)
+
     if "vocab_size" not in ee_kwargs:
         ee_kwargs["vocab_size"] = 0  # 占位，实际构建时由 entity_vocab 决定
 
@@ -221,7 +246,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
 
     entity_embedding_cfg = EntityEmbeddingConfig(**ee_kwargs)
 
-    # Batching
+    # Batching（支持 vocab / BERT 两种文本编码模式）
     batching_cfg = BatchingConfig(
         **_filter_kwargs(BatchingConfig, repr_raw.get("batching", {}))
     )
@@ -238,6 +263,17 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         **_filter_kwargs(EvaluationConfig, data.get("evaluation", {}))
     )
 
+    # ---------- BERT text encoder (optional) ----------
+    # JSON 约定：
+    # "bert_text_encoder": { ...BertTextEncoderConfig 字段... }
+    bert_te_raw = data.get("bert_text_encoder", {}) or {}
+    if isinstance(bert_te_raw, dict) and bert_te_raw:
+        bert_text_encoder_cfg: Optional[BertTextEncoderConfig] = BertTextEncoderConfig(
+            **_filter_kwargs(BertTextEncoderConfig, bert_te_raw)
+        )
+    else:
+        bert_text_encoder_cfg = None
+
     return ExperimentConfig(
         dataset=dataset_cfg,
         preprocess=preprocess_cfg,
@@ -252,6 +288,7 @@ def _build_experiment_config(data: Dict[str, Any]) -> ExperimentConfig:
         attention=attention_cfg,
         training=training_cfg,
         evaluation=evaluation_cfg,
+        bert_text_encoder=bert_text_encoder_cfg,
     )
 
 
