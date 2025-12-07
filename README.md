@@ -118,18 +118,6 @@ pip install -e .
 kan --config configs/experiment.json train
 ```
 
-或 Python API：
-
-```python
-from kan import KAN, KANConfig, Trainer
-
-cfg = KANConfig.from_json("configs/default.json")
-model = KAN(cfg)
-
-trainer = Trainer(model, cfg.training)
-trainer.fit()
-```
-
 ---
 
 ## ✨ 预测（Inference）
@@ -205,7 +193,8 @@ id,prob
 * KnowledgeEncoderConfig
 * AttentionConfig
 * TrainingConfig
-* KANConfig（顶层）
+* KANConfig
+...
 
 编辑 JSON 即可完成 **行为切换、模型结构替换、组件升级**。
 
@@ -213,10 +202,10 @@ id,prob
 
 # 🤝 致谢
 
-原论文作者团队
-Wikidata 社区
-所有贡献者
-以及 ——
+原论文作者团队  
+Wikidata 社区  
+所有贡献者  
+以及 ——  
 ✨ **你，阅读 README 的小可爱。** ✨
 
 ---
