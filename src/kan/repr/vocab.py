@@ -327,16 +327,11 @@ def build_entity_vocab(
     if cfg is None:
         cfg = VocabConfig(bos_token=None, eos_token=None)
 
-    def _entity_corpus() -> Iterable[Sequence[str]]:
+    def _entity_corpus():
         for s in samples:
             # 当前实体序列。
             # Current entity IDs sequence.
             if s.entities:
                 yield s.entities
-            # 上下文实体一并纳入词表。
-            # Also include context entities.
-            for ctx in s.entity_contexts:
-                if ctx:
-                    yield ctx
 
     return _build_vocab_from_corpus(_entity_corpus(), cfg)

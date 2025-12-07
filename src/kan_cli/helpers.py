@@ -39,6 +39,13 @@ from kan import (
     ExperimentConfig,
 )
 
+from transformers import (
+    get_linear_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_cosine_with_hard_restarts_schedule_with_warmup,
+    get_polynomial_decay_schedule_with_warmup,
+)
+
 from kan.repr.batching import BatchEncoding  # 仅用于类型注解与文档
 from kan.repr.text_embedding import TextEmbedding, TextEmbeddingConfig
 from kan.repr.entity_embedding import EntityEmbedding, EntityEmbeddingConfig
@@ -525,42 +532,81 @@ def build_optimizer(config: Any, model: nn.Module) -> Optimizer:
     return optimizer
 
 
-def build_scheduler(config: Any, optimizer: Optimizer) -> Optional[_LRScheduler]:
+def build_scheduler(config: Any, optimizer: Optimizer):
     """
-    @brief 基于 ExperimentConfig.training 构建学习率调度器（可选）。
-           Build an optional LR scheduler from ExperimentConfig.training.
-    @param config 实验配置对象，需包含 training 字段。
-           Experiment config expected to have a 'training' field.
-    @param optimizer 已构建好的优化器。Optimizer instance.
-    @return 若启用调度器则返回 _LRScheduler，否则返回 None。
-            _LRScheduler if enabled, else None.
-    @note 当前实现提供线性 warmup 调度策略：
-          - step < warmup_steps: 线性从 0 → 1
-          - step >= warmup_steps: 学习率保持基准值
-          This implementation uses a linear warmup schedule:
-          - step < warmup_steps: linear 0 → 1
-          - step >= warmup_steps: LR stays at base value.
+    @brief 使用 HuggingFace Transformers 提供的成熟学习率调度器。
+           Use HF Transformers’ LR schedulers.
+    @note 支持的调度器：
+          - "linear"  : 线性 warmup + 线性衰减
+          - "cosine"  : 线性 warmup + 余弦衰减
+          - "cosine_restart" : 余弦衰减 + 重启
+          - "poly"    : 多项式衰减
+          - None      : 不使用 scheduler
     """
+
     training_cfg = getattr(config, "training", None)
     if training_cfg is None:
-        logger.info("No config.training provided; not using LR scheduler.")
+        logger.info("No training config found; scheduler disabled.")
         return None
 
+    scheduler_type = getattr(training_cfg, "lr_scheduler", None)
     warmup_steps = getattr(training_cfg, "warmup_steps", 0)
-    if warmup_steps <= 0:
-        logger.info("warmup_steps <= 0; no LR scheduler will be used.")
+    total_steps = getattr(training_cfg, "total_steps", None)
+
+    # ✨ 无 scheduler 设置 → 直接禁用（正常情况）
+    if scheduler_type is None:
+        logger.info("No lr_scheduler specified; scheduler disabled.")
         return None
+
+    # ✨ 未配置 total_steps → 无法进行 decay，fallback 到 warmup-only
+    if total_steps is None or total_steps <= 0:
+        logger.warn(
+            f"training.total_steps is missing or invalid; "
+            f"fallback to warmup-only scheduler (type={scheduler_type})."
+        )
+
+        if warmup_steps > 0:
+            # warmup-only fallback：warmup 后保持常数学习率
+            return get_cosine_schedule_with_warmup(
+                optimizer, warmup_steps, warmup_steps + 1
+            )
+
+        logger.info("warmup_steps <= 0; scheduler disabled.")
+        return None
+
+    # ------------------------------
+    # 正式构建 HF Scheduler
+    # ------------------------------
 
     logger.info(
-        "Using linear warmup scheduler: warmup_steps=%d",
-        warmup_steps,
+        f"Using HF LR scheduler: type={scheduler_type}, "
+        f"warmup_steps={warmup_steps}, total_steps={total_steps}"
     )
 
-    def lr_lambda(step: int) -> float:
-        if step <= 0:
-            return 0.0
-        if step < warmup_steps:
-            return float(step) / float(max(1, warmup_steps))
-        return 1.0
+    if scheduler_type == "linear":
+        return get_linear_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    return LambdaLR(optimizer, lr_lambda=lr_lambda)
+    elif scheduler_type == "cosine":
+        return get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+
+    elif scheduler_type == "cosine_restart":
+        num_cycles = getattr(training_cfg, "num_cycles", 1)
+        return get_cosine_with_hard_restarts_schedule_with_warmup(
+            optimizer, warmup_steps, total_steps, num_cycles=num_cycles
+        )
+
+    elif scheduler_type == "poly":
+        power = getattr(training_cfg, "poly_power", 1.0)
+        return get_polynomial_decay_schedule_with_warmup(
+            optimizer,
+            warmup_steps,
+            total_steps,
+            lr_end=0.0,
+            power=power,
+        )
+
+    # 优雅降级：未知 scheduler → 不中断训练
+    logger.warning(
+        f"Unknown lr_scheduler={scheduler_type!r}; " f"falling back to no scheduler."
+    )
+    return None

@@ -22,11 +22,13 @@
     },
     "kg": {
         "endpoint_url": "https://query.wikidata.org/sparql",
-        "user_agent": "KAN-KG-Client/0.1 (https://www.nankai.edu.cn; mailto:guojiarui@mail.nankai.edu.cn)",
+        "user_agent": "KAN-KG-Client/0.1 (mailto:guojiarui@mail.nankai.edu.cn)",
         "timeout": 30,
         "max_neighbors": 32,
         "cache_dir": "data/kg_cache",
-        "language": "zh"
+        "language": "zh",
+        "max_workers": 12,
+        "neighbor_query_mode": "full"
     },
     "repr": {
         "text_vocab": {
@@ -105,11 +107,15 @@
         "batch_first": true
     },
     "training": {
-        "num_epochs": 20,
+        "num_epochs": 15,
         "learning_rate": 2e-5,
-        "weight_decay": 0.0,
-        "warmup_steps": 0,
+        "weight_decay": 0.01,
         "gradient_clip": 1.0,
+        "warmup_steps": 300,
+        "total_steps": 20000,
+        "lr_scheduler": "cosine",
+        "num_cycles": 1,
+        "poly_power": 1.0,
         "device": "cuda",
         "seed": 42,
         "output_dir": "train/models/weibo",

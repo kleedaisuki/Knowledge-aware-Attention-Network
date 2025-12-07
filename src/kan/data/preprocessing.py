@@ -7,17 +7,18 @@
 from __future__ import annotations
 
 import re
+import asyncio
 from dataclasses import dataclass
-from typing import List, Optional, Any, Sequence, Iterable, Dict
+from typing import List, Optional, Any, Sequence, Iterable, Dict, Tuple
 
 from kan.utils.logging import get_logger
 from kan.data.datasets import NewsSample
 from kan.data.knowledge_graph import KnowledgeGraphClient
 
-logger = get_logger(__name__)
-
-from ltp import LTP
+from ltp import LTP  # type: ignore[import-untyped]
 import jieba  # type: ignore[import-untyped]
+
+logger = get_logger(__name__)
 
 
 # ============================================================
@@ -53,8 +54,8 @@ class PreprocessConfig:
     remove_user_mentions: bool = True
     max_tokens: int = 256
     enable_kg: bool = True
-    tokenizer: str = "ltp"
-    ltp_model_kwargs: Optional[Dict] = None
+    tokenizer: str = "jieba"
+    ltp_model_kwargs: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -87,7 +88,7 @@ class Preprocessor:
     """
 
     def __init__(
-        self, cfg: PreprocessConfig, kg_client: KnowledgeGraphClient = None
+        self, cfg: PreprocessConfig, kg_client: Optional[KnowledgeGraphClient] = None
     ) -> None:
         """
         @brief 初始化预处理器。Initialize preprocessor.
@@ -95,15 +96,16 @@ class Preprocessor:
         @param kg_client 知识图谱客户端，需提供实体链接与实体上下文接口。
                Knowledge graph client providing entity linking & context APIs.
         @note kg_client 预期接口（新接口优先，旧接口作为兼容）：
-              - link_entities_from_tokens(tokens: Sequence[str]) -> Sequence[str]
-              - get_entity_contexts(entities: Sequence[str]) -> Sequence[Sequence[str]]
-              - （兼容旧版）link_entities(text: str) -> Sequence[str]
+              - async alink_entities_from_tokens(tokens: Sequence[str]) -> List[str]
+              - async aget_entity_contexts(entities: Sequence[str]) -> List[List[str]]
+              - link_entities_from_tokens(tokens: Sequence[str]) -> List[str]
+              - get_entity_contexts(entities: Sequence[str]) -> List[List[str]]
+              - （兼容旧版）link_entities(text: str) -> List[str]
         """
         self.cfg = cfg
         self.kg_client = kg_client
 
         # 统一的 tokenizer 类型标记（路由中枢）。
-        # Unified tokenizer type tag (routing center).
         raw_tok = getattr(self.cfg, "tokenizer", "ltp") or "ltp"
         tok = str(raw_tok).lower()
 
@@ -111,7 +113,6 @@ class Preprocessor:
         self._ltp: Any = None
 
         if tok == "ltp":
-            # 允许通过 config.ltp_model_kwargs 追加更多底层模型参数
             ltp_kwargs = getattr(self.cfg, "ltp_model_kwargs", None)
 
             try:
@@ -119,11 +120,11 @@ class Preprocessor:
                 self._ltp = LTP(**kwargs)
                 self._tokenizer_type = "ltp"
 
-                def _try_get(d: Dict, key: Any, default: Any = None):
+                def _try_get(d: Dict[str, Any], key: str, default: Any = None) -> Any:
                     if not isinstance(d, dict):
                         return default
                     value = d.get(key)
-                    return value if value is not None else default
+                    return default if value is None else value
 
                 logger.info(
                     "Preprocessor: initialized LTP tokenizer "
@@ -136,7 +137,7 @@ class Preprocessor:
                     _try_get(ltp_kwargs or {}, "cache_dir", None),
                     _try_get(ltp_kwargs or {}, "local_files_only", False),
                 )
-            except Exception as exc:  # pragma: no cover - 防御性降级
+            except Exception as exc:  # pragma: no cover
                 logger.error(
                     "Preprocessor: failed to initialize LTP with kwargs %s, "
                     "falling back to regex tokenizer. Error: %s",
@@ -156,8 +157,6 @@ class Preprocessor:
                 "Preprocessor: using simple regex-based tokenizer (tokenizer=%s).", tok
             )
         else:
-            # 未知配置统一回退到 regex，避免爆炸。
-            # Unknown tokenizer falls back to regex to avoid crash.
             self._tokenizer_type = "regex"
             logger.warning(
                 "Preprocessor: unknown tokenizer=%r, falling back to regex tokenizer.",
@@ -177,8 +176,6 @@ class Preprocessor:
         """
         @brief 按配置清洗原始文本（去 URL / 提及 / 空白等）。
                Clean raw text according to config (URLs, mentions, whitespaces).
-        @param text 原始文本。Raw text.
-        @return 清洗后的文本。Cleaned text.
         """
         orig = text
 
@@ -186,75 +183,46 @@ class Preprocessor:
             text = text.lower()
 
         if self.cfg.remove_urls:
-            # 非严格 URL 匹配，仅用于社交文本清洗
             text = re.sub(r"https?://\S+|www\.\S+", " ", text)
 
         if self.cfg.remove_user_mentions:
-            # 类微博/推特的 @username
             text = re.sub(r"@\w+", " ", text)
 
-        # 归一化空白
         text = re.sub(r"\s+", " ", text).strip()
 
         logger.debug("Clean text from: [%s...] to [%s...]", orig[:30], text[:30])
         return text
 
     def _tokenize_with_ltp(self, text: str) -> List[str]:
-        """
-        @brief 使用 LTP 对文本进行分词的后端实现。
-               Backend implementation of tokenization using LTP.
-        @param text 清洗后的文本。Cleaned text.
-        @return token 列表。List of tokens.
-        """
+        """使用 LTP 分词。Tokenize with LTP."""
         if self._ltp is None:
             raise RuntimeError("LTP instance is not initialized.")
 
         ltp = self._ltp
 
-        # --- 情况 1：老版 LTP（有 seg 方法） ---
         if hasattr(ltp, "seg"):
             seg_result = ltp.seg([text])
-            # seg(...) 既可能直接返回 segments，也可能返回 (segments, hidden)
             if isinstance(seg_result, tuple):
                 segments = seg_result[0]
             else:
                 segments = seg_result
-            tokens = list(segments[0])
-            return tokens
+            return list(segments[0])
 
-        # --- 情况 2：新版 LTP（Transformers 版，使用 pipeline 接口） ---
         if hasattr(ltp, "pipeline"):
-            # 只做分词（cws = Chinese Word Segmentation）
             output = ltp.pipeline([text], tasks=["cws"])
-
-            # 新版文档里 output.cws 是 List[List[str]]，但也可能是 dict["cws"]
             cws = getattr(output, "cws", None)
             if cws is None and isinstance(output, dict):
                 cws = output.get("cws")
-
             if cws is None:
                 raise RuntimeError("LTP pipeline output does not contain 'cws' field.")
+            return list(cws[0])
 
-            tokens = list(cws[0])
-            return tokens
-
-        # --- 情况 3：既没有 seg 也没有 pipeline，当作 LTP 不可用 ---
         raise RuntimeError(
-            "LTP instance has neither 'seg' nor 'pipeline' method; "
-            "cannot perform LTP tokenization."
+            "LTP instance has neither 'seg' nor 'pipeline' method; cannot tokenize."
         )
 
     def _tokenize_with_jieba(self, text: str) -> List[str]:
-        """
-        @brief 使用 jieba 对文本进行分词的后端实现。
-               Backend implementation of tokenization using jieba.
-        @param text 清洗后的文本。Cleaned text.
-        @return token 列表。List of tokens.
-        @note
-            - 仅在安装了 jieba 且 tokenizer='jieba' 时启用。
-              Enabled only when jieba is installed and tokenizer='jieba'.
-        """
-        # jieba.lcut 返回一个 token 列表，这里做简单 strip 过滤空白
+        """使用 jieba 分词。Tokenize with jieba."""
         tokens = [tok.strip() for tok in jieba.lcut(text) if tok and tok.strip()]
         logger.debug(
             "jieba tokenizer produced %d tokens, first few: %s",
@@ -267,16 +235,12 @@ class Preprocessor:
         """
         @brief 基于正则的简易分词实现，提取英文单词、数字和单个 CJK 字符。
                Simple regex-based tokenizer extracting English words, numbers and single CJK chars.
-        @param text 清洗后的文本。Cleaned text.
-        @return token 列表。List of tokens.
-        @note 作为 LTP / jieba 不可用时的后备方案，也可用于英文数据集。
-              Used as a fallback when LTP/jieba is unavailable, and for pure English datasets.
         """
         _TOKEN_PATTERN = re.compile(
             r"""
             [A-Za-z]+(?:'[A-Za-z]+)?   # 英文单词，允许内部一个撇号，如 don't
-            | \d+(?:\.\d+)?            # 阿拉伯数字，含简单小数
-            | [\u4e00-\u9fff]          # 单个 CJK（中文等）字符
+            | \d+(?:\.\d+)?            # 数字，含简单小数
+            | [\u4e00-\u9fff]          # 单个 CJK 字符
             """,
             re.VERBOSE,
         )
@@ -293,19 +257,9 @@ class Preprocessor:
 
     def _tokenize(self, text: str) -> List[str]:
         """
-        @brief 统一的 token 化入口，根据配置路由到具体实现。
-               Unified tokenization entry, routing to concrete backend by config.
-        @param text 清洗后的文本。Cleaned text.
-        @return token 列表（如配置指定，还会在此处做 max_tokens 截断）。
-                List of tokens (also truncated here if max_tokens > 0).
-        @note
-            - 路由逻辑集中在此处，方便以后扩展新的分词后端；
-              Routing logic is centralized here for easier extension.
-            - 各后端实现仅关心“如何把 text → tokens”，上层接口保持稳定。
-              Backend implementations only care about mapping text → tokens.
+        @brief 统一 token 化入口，根据配置路由到具体实现。
+               Unified tokenization entry.
         """
-        tokens: List[str]
-
         if self._tokenizer_type == "jieba":
             try:
                 tokens = self._tokenize_with_jieba(text)
@@ -325,106 +279,247 @@ class Preprocessor:
                     exc,
                 )
                 tokens = self._regex_tokenize(text)
-
         else:
-            # 默认 / 回退：正则分词
             tokens = self._regex_tokenize(text)
 
-        # 统一在这里处理 max_tokens 截断，保证行为可预期。
-        # Handle max_tokens truncation here to keep behavior consistent.
         if self.cfg.max_tokens > 0 and len(tokens) > self.cfg.max_tokens:
             tokens = tokens[: self.cfg.max_tokens]
 
         return tokens
 
     # ------------------------------------------------------------
-    # 知识图谱部分：实体与上下文 Entities & Contexts
+    # KG：核心异步实现（优先异步 API）
+    # KG: core async impl (prefer async APIs)
     # ------------------------------------------------------------
-    def _extract_entities_and_contexts(
+    async def _kg_link_and_context(
         self, text: str, tokens: Sequence[str]
-    ) -> tuple[List[str], List[List[str]]]:
+    ) -> Tuple[List[str], List[List[str]]]:
         """
-        @brief 使用知识图谱客户端抽取实体与实体上下文。
-               Use KG client to extract entities and their contexts.
-        @param text 原始或清洗后的文本（仅用于日志/回退）。Text (raw or cleaned), used for logging/fallback.
-        @param tokens 预处理得到的 token 序列。Token sequence produced by preprocessing.
-        @return (entities, entity_contexts)：
-                - entities: 实体 ID 列表。List of entity IDs.
-                - entity_contexts: 与 entities 对齐的一跳邻居 ID 列表。List of neighbor ID lists.
+        @brief 使用知识图谱客户端抽取实体与实体上下文（异步主路径）。
+               Use KG client to extract entities and contexts (async primary path).
         """
         if not self.cfg.enable_kg or self.kg_client is None:
-            # 仅文本模式，返回空实体与上下文
             return [], []
 
-        try:
-            # ✅ 优先使用基于 token 的实体链接
-            if hasattr(self.kg_client, "link_entities_from_tokens"):
-                raw_entities: Sequence[str] = self.kg_client.link_entities_from_tokens(
-                    tokens
-                )
-            else:
-                # 兼容旧实现：退回基于文本的接口
-                raw_entities = self.kg_client.link_entities(text)
+        kg = self.kg_client
+        loop = asyncio.get_running_loop()
 
-            entities = list(raw_entities)
+        # ---------- 实体链接：优先异步接口 ----------
+        entities: List[str]
 
-            raw_contexts: Sequence[Sequence[str]] = self.kg_client.get_entity_contexts(
-                entities
+        if hasattr(kg, "alink_entities_from_tokens"):
+            # 首选：直接用异步 token-based 接口
+            entities = await kg.alink_entities_from_tokens(tokens)  # type: ignore[attr-defined]
+        elif hasattr(kg, "alink_entities"):
+            # 次选：异步 text-based 接口
+            entities = await kg.alink_entities(text)  # type: ignore[attr-defined]
+        elif hasattr(kg, "link_entities_from_tokens"):
+            # 再退：同步 token-based，扔到线程池里
+            def _link_sync_tokens() -> List[str]:
+                return list(kg.link_entities_from_tokens(tokens))  # type: ignore[arg-type]
+
+            entities = await loop.run_in_executor(None, _link_sync_tokens)
+        elif hasattr(kg, "link_entities"):
+            # 最后：同步 text-based
+            def _link_sync_text() -> List[str]:
+                return list(kg.link_entities(text))  # type: ignore[arg-type]
+
+            entities = await loop.run_in_executor(None, _link_sync_text)
+        else:
+            logger.warning(
+                "KG client has no entity-linking API, return empty entities for now."
             )
-            entity_contexts: List[List[str]] = [list(ctx) for ctx in raw_contexts]
-
-            # 强制对齐：长度不一致时做截断 / 补空
-            if len(entity_contexts) < len(entities):
-                # 不足则补空列表
-                entity_contexts.extend(
-                    [[] for _ in range(len(entities) - len(entity_contexts))]
-                )
-            elif len(entity_contexts) > len(entities):
-                entity_contexts = entity_contexts[: len(entities)]
-
-            return entities, entity_contexts
-        except Exception as e:  # noqa: BLE001 简化处理
-            logger.error("KG extraction failed: %s", e)
-            # 出错时退化为仅文本模式
             return [], []
+
+        if not entities:
+            return [], []
+
+        # ---------- 实体上下文：优先异步接口 ----------
+        contexts: List[List[str]]
+
+        if hasattr(kg, "aget_entity_contexts"):
+            contexts = await kg.aget_entity_contexts(entities)  # type: ignore[attr-defined]
+        elif hasattr(kg, "get_entity_contexts"):
+
+            def _ctx_sync() -> List[List[str]]:
+                ctxs = kg.get_entity_contexts(entities)
+                return [list(c) for c in ctxs]
+
+            contexts = await loop.run_in_executor(None, _ctx_sync)
+        else:
+            logger.warning(
+                "KG client has no get_entity_contexts API, contexts will be empty."
+            )
+            contexts = [[] for _ in entities]
+
+        # 对齐长度，保证一一对应
+        if len(contexts) < len(entities):
+            contexts.extend([[] for _ in range(len(entities) - len(contexts))])
+        elif len(contexts) > len(entities):
+            contexts = contexts[: len(entities)]
+
+        return list(entities), contexts
+
+    def _kg_link_and_context_sync(
+        self, text: str, tokens: Sequence[str]
+    ) -> Tuple[List[str], List[List[str]]]:
+        """
+        @brief 同步 fallback：在无法使用 asyncio.run 的环境中使用。
+               Sync fallback used when asyncio.run cannot be used.
+        """
+        if not self.cfg.enable_kg or self.kg_client is None:
+            return [], []
+
+        kg = self.kg_client
+
+        # 这里就老老实实用同步 API，不再搞一层 event loop。
+        if hasattr(kg, "link_entities_from_tokens"):
+            entities = list(kg.link_entities_from_tokens(tokens))  # type: ignore[arg-type]
+        elif hasattr(kg, "link_entities"):
+            entities = list(kg.link_entities(text))  # type: ignore[arg-type]
+        else:
+            return [], []
+
+        if not entities:
+            return [], []
+
+        if hasattr(kg, "get_entity_contexts"):
+            ctxs = kg.get_entity_contexts(entities)
+            contexts = [list(c) for c in ctxs]
+        else:
+            contexts = [[] for _ in entities]
+
+        if len(contexts) < len(entities):
+            contexts.extend([[] for _ in range(len(entities) - len(contexts))])
+        elif len(contexts) > len(entities):
+            contexts = contexts[: len(entities)]
+
+        return entities, contexts
 
     # ------------------------------------------------------------
-    # 对单个样本进行预处理 Process one sample
+    # 单样本预处理（同步 API，内部优先异步 KG）
+    # Single-sample preprocess (sync API, async KG inside)
     # ------------------------------------------------------------
     def preprocess_sample(self, sample: NewsSample) -> PreprocessedSample:
         """
-        @brief 对单条 NewsSample 进行预处理，生成 PreprocessedSample。
-               Preprocess a single NewsSample into PreprocessedSample.
-        @param sample 输入样本。Input sample.
-        @return 预处理后的样本。Preprocessed sample.
+        @brief 对单条 NewsSample 进行预处理（同步 API）。
+               Preprocess a single NewsSample (sync API).
         """
         cleaned = self._clean_text(sample.text)
         tokens = self._tokenize(cleaned)
 
-        # ✅ 把 token 序列传给 KG，实体链接完全基于分好词的结果
-        entities, entity_contexts = self._extract_entities_and_contexts(cleaned, tokens)
+        # KG disabled / no client: text-only
+        if not self.cfg.enable_kg or self.kg_client is None:
+            return PreprocessedSample(
+                id=sample.id,
+                tokens=tokens,
+                entities=[],
+                entity_contexts=[],
+                label=sample.label,
+            )
+
+        # 优先使用 asyncio.run 驱动异步 KG
+        try:
+
+            async def _runner() -> Tuple[List[str], List[List[str]]]:
+                return await self._kg_link_and_context(cleaned, tokens)
+
+            entities, contexts = asyncio.run(_runner())
+        except RuntimeError as exc:
+            # 如果已经有事件循环（如 notebook / web 服务器），不能用 asyncio.run
+            # 这时退回到同步 KG fallback，至少不炸。
+            logger.warning(
+                "preprocess_sample: asyncio.run failed (%s), fallback to sync KG.",
+                exc,
+            )
+            entities, contexts = self._kg_link_and_context_sync(cleaned, tokens)
 
         return PreprocessedSample(
             id=sample.id,
             tokens=tokens,
             entities=entities,
-            entity_contexts=entity_contexts,
+            entity_contexts=contexts,
             label=sample.label,
         )
 
     # ------------------------------------------------------------
-    # 批量预处理 Process a batch
+    # 批处理预处理（同步 API，批量并发异步 KG）
+    # Batch preprocess (sync API, batched async KG)
     # ------------------------------------------------------------
     def preprocess_batch(
         self, samples: Iterable[NewsSample]
     ) -> List[PreprocessedSample]:
         """
-        @brief 批量预处理多个样本，常用于训练/推理阶段。
-               Preprocess a batch of samples, typically for training/inference.
-        @param samples NewsSample 可迭代对象。Iterable of NewsSample.
-        @return 预处理后样本列表。List of PreprocessedSample.
+        @brief 批量预处理多个样本（同步 API）。
+               Preprocess a batch of samples synchronously.
         """
-        results: List[PreprocessedSample] = []
-        for s in samples:
-            results.append(self.preprocess_sample(s))
-        return results
+        sample_list = list(samples)
+        if not sample_list:
+            return []
+
+        # 纯文本模式：不走 KG，简单 for-loop 即可
+        if not self.cfg.enable_kg or self.kg_client is None:
+            out: List[PreprocessedSample] = []
+            for s in sample_list:
+                cleaned = self._clean_text(s.text)
+                tokens = self._tokenize(cleaned)
+                out.append(
+                    PreprocessedSample(
+                        id=s.id,
+                        tokens=tokens,
+                        entities=[],
+                        entity_contexts=[],
+                        label=s.label,
+                    )
+                )
+            return out
+
+        # 清洗 & 分词：同步完成
+        cleaned_list: List[str] = []
+        token_list: List[List[str]] = []
+        id_list: List[int] = []
+        label_list: List[Optional[int]] = []
+
+        for s in sample_list:
+            cleaned = self._clean_text(s.text)
+            tokens = self._tokenize(cleaned)
+            cleaned_list.append(cleaned)
+            token_list.append(tokens)
+            id_list.append(s.id)
+            label_list.append(s.label)
+
+        async def _run_batch_kg() -> List[PreprocessedSample]:
+            # 为每个样本创建异步 KG 任务（**这里是真正的批量并发**）
+            tasks = [
+                self._kg_link_and_context(text, toks)
+                for text, toks in zip(cleaned_list, token_list)
+            ]
+            kg_results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            out: List[PreprocessedSample] = []
+            for sid, label, tokens, (entities, ctxs) in zip(
+                id_list, label_list, token_list, kg_results
+            ):
+                out.append(
+                    PreprocessedSample(
+                        id=sid,
+                        tokens=tokens,
+                        entities=entities,
+                        entity_contexts=ctxs,
+                        label=label,
+                    )
+                )
+            return out
+
+        try:
+            return asyncio.run(_run_batch_kg())
+        except RuntimeError as exc:
+            # 已存在事件循环时退回逐样本同步；虽然慢，但保证行为正确。
+            logger.warning(
+                "preprocess_batch: asyncio.run failed (%s), fallback to per-sample sync.",
+                exc,
+            )
+            results: List[PreprocessedSample] = []
+            for s in sample_list:
+                results.append(self.preprocess_sample(s))
+            return results

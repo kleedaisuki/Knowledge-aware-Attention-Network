@@ -10,10 +10,8 @@
 * [CLI 整体结构](#cli-整体结构)
 * [快速开始](#快速开始)
 * [命令说明](#命令说明)
-
   * [1. `train`](#1-train)
-  * [2. `evaluate`](#2-evaluate)
-  * [3. `predict`](#3-predict)
+  * [2. `predict`](#3-predict)
 * [任务注册机制](#任务注册机制)
 * [工作目录结构](#工作目录结构)
 * [常见问题](#常见问题)
@@ -25,7 +23,6 @@
 KAN CLI 是运行本项目的**统一入口**，用于：
 
 * 🚀 **训练模型**（`train`）
-* 📊 **在带标签集上评估模型**（`evaluate`）
 * 🔮 **在无标签数据上生成预测**（`predict`）
 
 CLI 的核心设计原则：
@@ -33,7 +30,7 @@ CLI 的核心设计原则：
 * **所有行为由配置文件 ExperimentConfig 定义**
 * **运行流程由 ExperimentRuntime 构建（状态机 + 环境）**
 * **任务通过 task registry 注册、统一调度**
-* **CLI 本身只做参数解析与调度，不包含业务逻辑**
+* **CLI 本身只做参数解析与调度，不包含逻辑**
 
 ---
 
@@ -76,21 +73,11 @@ kan --config configs/experiment.json train
 ```
 train/
   ├── models/
-  ├── logs/
   ├── vocabs/
   └── ...
 ```
 
-### 3. 评估模型
-
-```bash
-kan --config configs/experiment.json \
-    evaluate --checkpoint train/models/model.pt \
-             --metrics eval.json \
-             --probs eval_probs.csv
-```
-
-### 4. 预测（无标签集）
+### 3. 预测（无标签集）
 
 ```bash
 kan --config configs/experiment.json \
@@ -186,10 +173,8 @@ main.py → parse args → create_runtime → run_task(task_name)
 
 ```
 train/
-  ├── logs/               # 日志文件
   ├── models/             # checkpoint
   ├── vocabs/             # text/entity vocab
-  ├── preds/              # predict 输出
   └── metadata.json       # runtime 元信息
 ```
 

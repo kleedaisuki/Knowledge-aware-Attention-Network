@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, asdict
-from typing import Iterable
+from typing import Iterable, Optional
 
 import torch
 from torch import nn, Tensor
@@ -28,32 +28,62 @@ logger = get_logger(__name__)
 @dataclass
 class TrainingConfig:
     """
-    @brief 训练相关超参数配置。Training hyper-parameters configuration.
-    @param num_epochs 训练轮数。Number of training epochs.
-    @param learning_rate 学习率。Learning rate.
-    @param weight_decay 权重衰减系数。Weight decay factor.
-    @param warmup_steps 线性 warmup 的步数（0 表示不启用）。Steps for linear warmup (0 disables).
-    @param gradient_clip 梯度裁剪阈值（0 表示不裁剪）。Max grad-norm for clipping (0 disables).
+    @brief 训练相关超参数配置（适配 Transformer/BERT，含学习率调度器）。
+           Training hyper-parameters configuration for Transformer/BERT, with LR scheduler support.
 
-    @param device 训练设备标识，例如 "cuda" 或 "cpu"。
-                  Device string, e.g. "cuda" or "cpu".
+    @param num_epochs 训练轮数。Number of training epochs.
+    @param learning_rate 基础学习率（优化器的 base LR）。Base learning rate for the optimizer.
+    @param weight_decay 权重衰减系数（AdamW 等优化器使用）。Weight decay factor (for AdamW, etc.).
+    @param gradient_clip 梯度裁剪阈值（0 表示不裁剪，使用全局范数裁剪）。Max grad-norm for clipping (0 disables).
+
+    @param warmup_steps 学习率 warmup 步数（0 表示不启用 warmup）。Number of warmup steps (0 disables).
+    @param total_steps 训练总步数，用于 warmup 之后的衰减策略；若<=0，则仅根据 warmup_steps 决定是否启用简化调度器。
+                       Total training steps for LR decay after warmup; if <=0, only warmup-only / no scheduler is used.
+    @param lr_scheduler 学习率调度器类型：
+                        - "cosine"         : 线性 warmup + 余弦衰减（推荐默认）
+                        - "linear"         : 线性 warmup + 线性衰减
+                        - "cosine_restart" : 线性 warmup + 余弦衰减并周期重启
+                        - "poly"           : 线性 warmup + 多项式衰减
+                        - None             : 不使用调度器
+                        LR scheduler type as string, see above for supported values.
+    @param num_cycles 对 "cosine_restart" 有效，控制余弦重启周期数。Number of cycles for "cosine_restart".
+    @param poly_power 对 "poly" 有效，多项式衰减幂次；1.0 等价于线性衰减。Polynomial decay power for "poly".
+
+    @param device 训练设备标识，例如 "cuda" 或 "cpu"。Device string, e.g. "cuda" or "cpu".
     @param seed 全局随机种子。Global random seed.
 
-    @param output_dir 模型保存目录。Directory to save model checkpoints.
+    @param output_dir 模型 checkpoint 保存目录。Directory to save model checkpoints.
     @param log_dir 日志目录（当前主要用于占位，日志通过 logging 模块输出）。
-                   Log directory (currently informational; logging uses logging module).
+                   Log directory (mainly informational; logging uses the logging module).
     @param save_every 每多少个 epoch 保存一次模型。Save checkpoint every N epochs.
+
+    @note
+        - 若 lr_scheduler 非空且 total_steps > 0，则构建完整的 warmup+衰减调度器；
+          否则根据 warmup_steps 决定是否启用简化 warmup-only 调度器或完全关闭调度器。
+          If lr_scheduler is not None and total_steps > 0, a full warmup+decay scheduler is built;
+          otherwise, a simplified warmup-only schedule or no scheduler is used depending on warmup_steps.
     """
 
-    num_epochs: int = 20
-    learning_rate: float = 1e-3
-    weight_decay: float = 0.0
-    warmup_steps: int = 0
-    gradient_clip: float = 0.0
+    # 基础训练参数 Basic training params
+    num_epochs: int = 5
+    learning_rate: float = 2e-5
+    weight_decay: float = 0.01
+    gradient_clip: float = 1.0
 
+    # 学习率调度器 LR scheduler params
+    warmup_steps: int = 0
+    total_steps: int = 0
+    lr_scheduler: Optional[str] = (
+        "cosine"  # 默认用最适合 Transformer 的余弦 warmup 套餐
+    )
+    num_cycles: int = 1
+    poly_power: float = 1.0
+
+    # 设备 & 随机性 Device & randomness
     device: str = "cuda"
     seed: int = 42
 
+    # I/O 相关 I/O paths
     output_dir: str = "train/models"
     log_dir: str = "train/logs"
     save_every: int = 1
