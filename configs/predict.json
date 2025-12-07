@@ -1,6 +1,6 @@
 {
     "dataset": {
-        "csv_path": "data/news/train.csv",
+        "csv_path": "data/news/Atest.csv",
         "batch_size": 32,
         "shuffle": true,
         "text_field": "text",
@@ -26,7 +26,7 @@
         "timeout": 30,
         "max_neighbors": 32,
         "cache_dir": "data/kg_cache",
-        "language": "zh"
+        "language": "en"
     },
     "repr": {
         "text_vocab": {
@@ -105,19 +105,19 @@
         "batch_first": true
     },
     "training": {
-        "num_epochs": 5,
+        "num_epochs": 20,
         "learning_rate": 2e-5,
         "weight_decay": 0.0,
         "warmup_steps": 0,
         "gradient_clip": 1.0,
-        "device": "cpu",
+        "device": "cuda",
         "seed": 42,
         "output_dir": "train/models/weibo",
         "log_dir": "train/logs/weibo",
         "save_every": 1
     },
     "evaluation": {
-        "device": "cpu",
+        "device": "cuda",
         "seed": 42,
         "checkpoint_path": null,
         "results_csv": "train/results/results.csv",

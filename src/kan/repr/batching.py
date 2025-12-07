@@ -447,6 +447,29 @@ class Batcher:
             token_padding_mask = attention_mask.eq(0)
 
         # =======================
+        # 样本 ID 与标签部分 IDs & labels
+        # =======================
+        # 统一从 encoded_samples 中提取 ids / labels，供后续所有分支使用
+        ids = torch.tensor(
+            [e.id for e in encoded_samples],
+            dtype=torch.long,
+        )
+
+        label_values = [e.label for e in encoded_samples]
+
+        # 情况 1：全部没有标签（测试集），labels=None
+        if all(l is None for l in label_values):
+            labels = None
+        # 情况 2：有的有标签、有的没标签——这是配置/数据问题，直接报错提醒
+        elif any(l is None for l in label_values):
+            raise ValueError(
+                "Batcher.collate: mixed labeled and unlabeled samples within one batch; "
+                "please make sure train/valid/test splits are not interleaved."
+            )
+        # 情况 3：全部有标签（训练/验证集）
+        else:
+            labels = torch.tensor(label_values, dtype=torch.long)
+        # =======================
         # 实体部分 Entity part
         # =======================
         max_entities = max(len(e.entity_ids) for e in encoded_samples)
