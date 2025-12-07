@@ -38,8 +38,8 @@ class KnowledgeGraphConfig:
     @param max_neighbors 每个实体最多返回多少一跳邻居。Max number of 1-hop neighbors per entity.
     @param cache_dir 邻居缓存目录（可选），用于减少重复 SPARQL / 搜索请求。
            Optional cache directory for neighbor / search cache to reduce remote calls.
-    @param language 查询 label / 搜索时使用的语言代码。
-           Language code used when searching for labels.
+    @param language 查询 label / 搜索时使用的语言代码（如 "zh"、"en"）。
+           Language code used when searching for labels, e.g. "zh", "en".
     """
 
     endpoint_url: str = "https://query.wikidata.org/sparql"
@@ -47,7 +47,9 @@ class KnowledgeGraphConfig:
     timeout: int = 30
     max_neighbors: int = 32
     cache_dir: Optional[str] = "data/kg_cache"
-    language: str = "en"
+    # 默认使用中文 zh，更适配当前中文数据集；英文任务可以在配置里显式改为 "en"。
+    # Default to "zh" for Chinese datasets; use "en" explicitly for English tasks.
+    language: str = "zh"
 
 
 # ============================================================
@@ -70,12 +72,14 @@ class KnowledgeGraphClient:
         self._sparql: Optional[SPARQLWrapper] = None
         self._neighbor_cache: Dict[str, List[str]] = {}
         # 表面形式 → QID 列表的内存缓存
+        # Surface-form → QID list in-memory cache.
         self._surface_cache: Dict[str, List[str]] = {}
 
         if self.cfg.cache_dir is not None:
             os.makedirs(self.cfg.cache_dir, exist_ok=True)
 
             # 预加载磁盘上的搜索缓存（若存在）。
+            # Preload search cache from disk if exists.
             search_cache_path = Path(self.cfg.cache_dir) / "surface_to_qid.json"
             if search_cache_path.is_file():
                 try:
@@ -106,7 +110,7 @@ class KnowledgeGraphClient:
         return self._sparql
 
     # ------------------------------------------------------------
-    # 实体链接：从文本 → 实体 ID 列表
+    # 实体链接：基于 token 的接口
     # ------------------------------------------------------------
 
     def _save_surface_cache(self) -> None:
@@ -122,43 +126,6 @@ class KnowledgeGraphClient:
                 json.dump(self._surface_cache, f, ensure_ascii=False, indent=2)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"Failed to save surface cache: {e}")
-
-    def _extract_candidate_spans(self, text: str) -> List[str]:
-        """
-        @brief 从原始文本中抽取用于 Wikidata 搜索的候选片段。
-               Extract candidate surface forms from raw text for Wikidata search.
-        @param text 输入文本。Input text.
-        @return 候选片段列表（去重后）。List of candidate surface forms (deduplicated).
-        @note
-            * 英文：尝试匹配连续的大写开头词，如 "Barack Obama"。
-            * 其它语言：退化为基于空格的 token，再过滤掉太短的 token。
-              For non-English languages, we fall back to space-based tokens and
-              drop very short ones.
-        """
-        candidates: set[str] = set()
-
-        # 1) 已内嵌的 QID 仍然直接识别出来（便于调试）。
-        for qid in re.findall(r"\bQ[0-9]+\b", text):
-            candidates.add(qid)
-
-        # 2) 英文专名：连续的首字母大写单词序列。
-        proper_name_pattern = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b")
-        for m in proper_name_pattern.finditer(text):
-            span = m.group(1).strip()
-            if len(span) >= 3:
-                candidates.add(span)
-
-        # 3) Fallback：基于空格的简单 token 化。
-        for tok in text.split():
-            tok = tok.strip()
-            if len(tok) < 3:
-                continue
-            # 过滤纯标点
-            if all(ch in ",.;:!?\"'()[]{}" for ch in tok):
-                continue
-            candidates.add(tok)
-
-        return list(candidates)
 
     def _search_wikidata(self, surface: str, limit: int = 1) -> List[str]:
         """
@@ -215,37 +182,78 @@ class KnowledgeGraphClient:
 
         return results[:limit]
 
-    def link_entities(self, text: str) -> List[str]:
+    def link_entities_from_tokens(self, tokens: Sequence[str]) -> List[str]:
         """
-        @brief 利用 Wikidata 搜索 API 进行轻量级实体链接。
-               Perform lightweight entity linking using Wikidata search API.
-        @param text 输入文本。Input text.
-        @return 实体 ID 列表（如 ["Q76", "Q30"]）。List of entity IDs, e.g. ["Q76", "Q30"].
+        @brief 基于分词结果的实体链接接口，使用每个 token 作为 Wikidata 搜索表面形式。
+               Entity linking API based on token sequence, using each token as a Wikidata search surface form.
+        @param tokens 文本分词后的 token 序列。Token sequence obtained from text preprocessing.
+        @return 去重后的实体 ID 列表，例如 ["Q76", "Q30"]。
+                Deduplicated list of entity IDs, e.g. ["Q76", "Q30"].
         @note
-            这不是一个“工业级”的实体链接器，只是：
-            1) 抽取若干候选片段（proper names / tokens）；
-            2) 对每个候选调用 Wikidata 搜索；
-            3) 合并得到的若干 QID。
-            It is NOT a full-fledged EL system, but:
-            1) extracts several candidate spans;
-            2) queries Wikidata search for each;
-            3) merges the resulting QIDs.
+            - 假定分词已在上游完成（例如 Preprocessor），这里不会再次对原始文本分词；
+              This API assumes tokenization has already been performed upstream.
+            - 会过滤掉长度为 1 的 token 以及纯标点 token，减少噪音；
+              1-character tokens and pure punctuation tokens are filtered out.
+            - 如 token 本身形如 "Q76"，则直接视为实体 ID 而不再调用搜索接口。
+              Tokens that look like "Q76" are treated as entity IDs directly.
         """
-        candidates = self._extract_candidate_spans(text)
-        entities: List[str] = []
+        punctuation_chars = ",.;:!?\"'()[]{}，。！？；：【】「」“”、"
+        cleaned: List[str] = []
+        for tok in tokens:
+            if tok is None:
+                continue
+            surf = str(tok).strip()
+            if not surf:
+                continue
+            # 过滤长度为 1 的 token（单字、符号等）
+            if len(surf) == 1:
+                continue
+            # 过滤纯标点 token
+            if all(ch in punctuation_chars for ch in surf):
+                continue
+            cleaned.append(surf)
 
-        for surf in candidates:
+        # 保持顺序去重
+        dedup_surfaces: List[str] = []
+        seen: set[str] = set()
+        for surf in cleaned:
+            if surf in seen:
+                continue
+            seen.add(surf)
+            dedup_surfaces.append(surf)
+
+        entities: List[str] = []
+        for surf in dedup_surfaces:
+            # 如果本身就是 QID，直接接受
+            if re.fullmatch(r"Q[0-9]+", surf):
+                entities.append(surf)
+                continue
             qids = self._search_wikidata(surf, limit=1)
             entities.extend(qids)
 
-        # 去重并排序，保持结果稳定。
         unique = sorted(set(entities))
         logger.info(
-            "link_entities: found entities %s from text snippet: %r",
+            "link_entities_from_tokens: found entities %s from token snippet: %r",
             unique,
-            text[:80],
+            dedup_surfaces[:10],
         )
         return unique
+
+    def link_entities(self, text: str) -> List[str]:
+        """
+        @brief 兼容旧接口：对输入文本做简单空白切分后，调用基于 token 的实体链接实现。
+               Backward-compatible API: split text on whitespace and delegate to token-based EL.
+        @param text 输入文本。Input text.
+        @return 实体 ID 列表，例如 ["Q76", "Q30"]。
+                List of entity IDs, e.g. ["Q76", "Q30"].
+        @note
+            - 新代码路径应优先调用 link_entities_from_tokens(tokens)，
+              这里仅作为兜底与兼容已有调用。
+        """
+        if not text:
+            return []
+        tokens = [tok for tok in re.split(r"\s+", text) if tok]
+        return self.link_entities_from_tokens(tokens)
 
     # ------------------------------------------------------------
     # 邻居缓存：磁盘读写

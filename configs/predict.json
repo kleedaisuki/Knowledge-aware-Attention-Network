@@ -13,7 +13,7 @@
         "remove_user_mentions": true,
         "max_tokens": 512,
         "enable_kg": true,
-        "tokenizer": "ltp",
+        "tokenizer": "jieba",
         "ltp_model_kwargs": {
             "pretrained_model_name_or_path": "LTP/small",
             "force_download": true,
@@ -26,7 +26,7 @@
         "timeout": 30,
         "max_neighbors": 32,
         "cache_dir": "data/kg_cache",
-        "language": "en"
+        "language": "zh"
     },
     "repr": {
         "text_vocab": {
